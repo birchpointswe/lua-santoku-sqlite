@@ -1,5 +1,7 @@
 # Now
 
+- Allow prop for all and iter
+
 - Support sqlite "in" cluase with json_each
 - Support iter:clone()/recompile for
 

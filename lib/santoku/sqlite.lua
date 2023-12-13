@@ -10,7 +10,6 @@ M.MT = {
 }
 
 M.MT_SQLITE_DB = {
-  __name = "santoku_sqlite_db",
   __index = function (o, k)
     return o.db[k]
   end
