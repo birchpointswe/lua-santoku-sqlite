@@ -5,6 +5,9 @@
 - Support sqlite "in" cluase with json_each
 - Support iter:clone()/recompile for
 
+- Throw error when iter invoked twice on same prepareted statement, or consider
+  calling clone
+
 - Abstract database interface to work with luasql dbs (refer to the
   santoku.web.sqlite compatibility layer)
 
