@@ -1,6 +1,6 @@
 local assert = require("luassert")
 local test = require("santoku.test")
-local err = require("santoku.err")
+local check = require("santoku.check")
 
 local sql = require("santoku.sqlite")
 
@@ -24,7 +24,7 @@ test("sqlite", function ()
     assert.is_nil(res)
 
     local ok, addcity = db:runner([[
-      insert into cities (name, state) values ($1, $2)
+      insert into cities (name, state) values (?, ?)
     ]])
     assert.equals(true, ok, addcity)
 
@@ -49,7 +49,7 @@ test("sqlite", function ()
     assert.is_nil(val)
 
     local ok, getcity = db:getter([[
-      select * from cities where name = $1
+      select * from cities where name = ?
     ]])
     assert.equals(true, ok, getcity)
 
@@ -62,7 +62,7 @@ test("sqlite", function ()
     assert.same(city, { name = "Albany", state = "New York" })
 
     local ok, getcitystate = db:getter([[
-      select * from cities where name = $1
+      select * from cities where name = ?
     ]], "state")
     assert.equals(true, ok, getcitystate)
 
@@ -101,28 +101,28 @@ test("sqlite", function ()
 
   test("should handle co iterators", function ()
 
-    local db = err.check(sql.open_memory())
+    local db = check(sql.open_memory())
 
-    err.check(db:exec([[
+    check(db:exec([[
       create table numbers (
         n integer
       );
     ]]))
 
-    local addn = err.check(db:inserter([[
-      insert into numbers (n) values ($1)
+    local addn = check(db:inserter([[
+      insert into numbers (n) values (?)
     ]]))
 
     for i = 1, 100 do
-      err.check(addn(i))
+      check(addn(i))
     end
 
-    local getns = err.check(db:iter([[
+    local getns = check(db:iter([[
       select * from numbers
     ]]))
 
-    local as = err.check(getns()):co():take(2):map(err.check):vec()
-    local bs = err.check(getns()):co():take(2):map(err.check):vec()
+    local as = check(getns()):co():take(2):map(check):vec()
+    local bs = check(getns()):co():take(2):map(check):vec()
 
     assert.same(as, bs)
 
@@ -130,23 +130,23 @@ test("sqlite", function ()
 
   test("should handle with clauses", function ()
 
-    local db = err.check(sql.open_memory())
+    local db = check(sql.open_memory())
 
-    err.check(db:exec([[
+    check(db:exec([[
       create table numbers (
         n integer
       );
     ]]))
 
-    local addn = err.check(db:inserter([[
-      insert into numbers (n) values ($1)
+    local addn = check(db:inserter([[
+      insert into numbers (n) values (?)
     ]]))
 
     for i = 1, 100 do
-      err.check(addn(i))
+      check(addn(i))
     end
 
-    local getns = err.check(db:getter([[
+    local getns = check(db:getter([[
       with evens as (select * from numbers where n % 2 == 0)
       select n from evens
       order by n desc
