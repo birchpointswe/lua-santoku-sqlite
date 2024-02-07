@@ -1,276 +1,174 @@
-local gen = require("santoku.gen")
-local compat = require("santoku.compat")
-local check = require("santoku.check")
 local sqlite = require("lsqlite3")
 
-local M = {}
+local err = require("santoku.error")
+local error = err.error
 
-M.MT = {
-  __index = sqlite
-}
+local varg = require("santoku.varg")
+local vlen = varg.len
 
-M.MT_SQLITE_DB = {
-  __index = function (o, k)
-    return o.db[k]
-  end
-}
+local iter = require("santoku.iter")
+local last = iter.last
+local collect = iter.collect
 
-M.MT_SQLITE_STMT = {
-  __index = function (o, k)
-    return o.stmt[k]
-  end,
-  __call = function (o, ...)
-    return o.fn(...)
-  end
-}
+local validate = require("santoku.validate")
+local isprimitive = validate.isprimitive
+local hasindex = validate.hasindex
 
-M._check = function (db, res, code, msg)
+local function check (db, res, code, msg)
   if not res then
     if not msg and db then
-      msg = db.db:errmsg()
+      msg = db:errmsg()
     end
     if not code and db then
-      code = db.db:errcode()
+      code = db:errcode()
     end
-    return false, msg, code
+    error(msg, code)
   else
-    return true, res
+    return res
   end
 end
 
-
-
-M._bind = function (stmt, ...)
-  if select("#", ...) == 0 then
+local function bind (stmt, ...)
+  if vlen(...) == 0 then
     return stmt
   end
-  local t = select(1, ...)
-  if not compat.isprimitive(t) and compat.hasmeta.index(t) then
+  local t = ...
+  if not isprimitive(t) and hasindex(t) then
     return stmt:bind_names(t)
   else
     return stmt:bind_values(...)
   end
 end
 
-M._query = function (db, stmt, ...)
+local function query (db, stmt, ...)
   stmt:reset()
-  local ok = M._bind(stmt, ...)
-  if not ok then
-    return false, db.db:errmsg(), db.db:errcode()
-  else
-    local res = nil
-    local err = false
-    return true, gen(function (yield)
-      while true do
-        res = stmt:step()
-        if res == sqlite.ROW then
-          yield(true, stmt:get_named_values())
-        elseif res == sqlite.DONE then
-          break
-        else
-          err = true
-          break
-        end
-      end
-      stmt:reset()
-      if err then
-        yield(false, db.db:errmsg(), db.db:errcode())
-      end
-    end)
-  end
-end
-
-M._get_one = function (db, stmt, ...)
-  local ok = M._bind(stmt, ...)
-  if not ok then
-    return false, db.db:errmsg(), db.db:errcode()
-  else
+  bind(stmt, ...)
+  return function ()
     local res = stmt:step()
     if res == sqlite.ROW then
-      local val = stmt:get_named_values()
-      stmt:reset()
-      return true, val
+      return stmt:get_named_values()
     elseif res == sqlite.DONE then
-      stmt:reset()
-      return true
+      return
     else
-      local em, ec = db.db:errmsg(), db.db:errcode()
-      stmt:reset()
-      return false, em, ec
+      return error(db.db:errmsg(), db.db:errcode())
     end
   end
 end
 
-M._get_val = function (db, stmt, prop, ...)
-  local ok, val = M._get_one(db, stmt, ...)
-  if ok and val then
-    return true, val[prop]
-  elseif ok and not val then
-    return true, nil
+local function get_one (db, stmt, ...)
+  stmt:reset()
+  bind(stmt, ...)
+  local res = stmt:step()
+  if res == sqlite.ROW then
+    local val = stmt:get_named_values()
+    return val
+  elseif res == sqlite.DONE then
+    return
   else
-    return false, val
+    return error(db.db:errmsg(), db.db:errcode())
   end
 end
 
-M.open = function (...)
-  local ok, db, cd = M._check(nil, sqlite.open(...))
-  if not ok then
-    return false, db, cd
-  else
-    return true, M.wrap(db)
+local function get_val (db, stmt, prop, ...)
+  local val = get_one(db, stmt, ...)
+  if val then
+    return val[prop]
   end
 end
 
-M.open_memory = function (...)
-  local ok, db, cd = M._check(nil, sqlite.open_memory(...))
-  if not ok then
-    return false, db, cd
-  else
-    return true, M.wrap(db)
-  end
-end
-
-M.open_ptr = function (...)
-  local ok, db, cd = M._check(nil, sqlite.open_ptr(...))
-  if not ok then
-    return false, db, cd
-  else
-    return true, M.wrap(db)
-  end
-end
-
-M.wrap = function (db)
-
-
-
-  return setmetatable({
+local function wrap (db)
+  return {
 
     db = db,
 
-    begin = function (db)
-      local res = db.db:exec("begin;")
+    begin = function ()
+      local res = db:exec("begin;")
       if res ~= sqlite.OK then
-        return false, db.db:errmsg(), db.db:errcode()
-      else
-        return true
+        error(db:errmsg(), db:errcode())
       end
     end,
 
-    commit = function (db)
-      local res = db.db:exec("commit;")
+    commit = function ()
+      local res = db:exec("commit;")
       if res ~= sqlite.OK then
-        return false, db.db:errmsg(), db.db:errcode()
-      else
-        return true
+        error(db:errmsg(), db:errcode())
       end
     end,
 
-    rollback = function (db)
-      local res = db.db:exec("rollback;")
+    rollback = function ()
+      local res = db:exec("rollback;")
       if res ~= sqlite.OK then
-        return false, db.db:errmsg(), db.db:errcode()
-      else
-        return true
+        error(db:errmsg(), db:errcode())
       end
     end,
 
-    exec = function (db, ...)
-      local res = db.db:exec(...)
+    exec = function (...)
+      local res = db:exec(...)
       if res ~= sqlite.OK then
-        return false, db.db:errmsg(), db.db:errcode()
-      else
-        return true
+        error(db:errmsg(), db:errcode())
       end
     end,
 
-    iter = function (db, sql)
-      local ok, stmt, cd = M._check(db, db.db:prepare(sql))
-      if not ok then
-        return false, stmt, cd
-      else
-        return true, M.wrapstmt(stmt, function (...)
-          return M._query(db, stmt, ...)
-        end)
+    iter = function (sql)
+      local stmt = check(db, db:prepare(sql))
+      return function (...)
+        return query(db, stmt, ...)
       end
     end,
 
-    all = function (db, sql)
-      local ok, stmt, cd = M._check(db, db.db:prepare(sql))
-      if not ok then
-        return false, stmt, cd
-      else
-        return true, M.wrapstmt(stmt, function (...)
-          local ok, iter, cd = M._query(db, stmt, ...)
-          if not ok then
-            return ok, iter, cd
-          else
-            return check:wrap(function (check)
-              return iter:map(check):vec()
-            end)
-          end
-        end)
+    all = function (sql)
+      local stmt = check(db, db:prepare(sql))
+      return function (...)
+        return collect(query(db, stmt, ...))
       end
     end,
 
-    runner = function (db, sql)
-      local ok, stmt, cd = M._check(db, db.db:prepare(sql))
-      if not ok then
-        return false, stmt, cd
-      else
-        return true, M.wrapstmt(stmt, function (...)
-          local ok, iter, cd = M._query(db, stmt, ...)
-          if not ok then
-            return false, iter, cd
-          end
-          local val
-          iter:each(function (ok0, val0, cd0)
-            ok, val, cd = ok0, val0, cd0
-          end)
-          return ok, val, cd
-        end)
+    runner = function (sql)
+      local stmt = check(db, db:prepare(sql))
+      return function (...)
+        return last(query(db, stmt, ...))
       end
     end,
 
-    getter = function (db, sql, prop)
-      local ok, stmt, cd = M._check(db, db.db:prepare(sql))
-      if not ok then
-        return false, stmt, cd
+    getter = function (sql, prop)
+      local stmt = check(db, db:prepare(sql))
+      if prop then
+        return function (...)
+          return get_val(db, stmt, prop, ...)
+        end
       else
-        return true, M.wrapstmt(stmt, function (...)
-          if prop then
-            return M._get_val(db, stmt, prop, ...)
-          else
-            return M._get_one(db, stmt, ...)
-          end
-        end)
-      end
-    end,
-
-    inserter = function (db, sql)
-      local ok, getter, cd = db:getter(sql)
-      if not ok then
-        return false, getter, cd
-      else
-        return true, function (...)
-          local ok, err, cd = getter(...)
-          if ok then
-            return true, db.db:last_insert_rowid()
-          else
-            return false, err, cd
-          end
+        return function (...)
+          return get_one(db, stmt, ...)
         end
       end
     end,
 
-  }, M.MT_SQLITE_DB)
+    inserter = function (sql)
+      local stmt = check(db, db:prepare(sql))
+      return function (...)
+        get_one(db, stmt, ...)
+        return db:last_insert_rowid()
+      end
+    end,
 
+  }
 end
 
-M.wrapstmt = function (stmt, fn)
-  return setmetatable({
-    stmt = stmt,
-    fn = fn,
-  }, M.MT_SQLITE_STMT)
+local function open (...)
+  return wrap(check(nil, sqlite.open(...)))
 end
 
-return setmetatable(M, M.MT)
+local function open_memory (...)
+  return wrap(check(nil, sqlite.open_memory(...)))
+end
+
+local function open_ptr (...)
+  return wrap(check(nil, sqlite.open_ptr(...)))
+end
+
+return {
+  open = open,
+  open_memory = open_memory,
+  open_ptr = open_ptr,
+  wrap = wrap,
+}

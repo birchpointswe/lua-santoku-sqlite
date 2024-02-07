@@ -1,159 +1,140 @@
-local assert = require("luassert")
 local test = require("santoku.test")
-local check = require("santoku.check")
+local serialize = require("santoku.serialize") -- luacheck: ignore
+
+local err = require("santoku.error")
+local assert = err.assert
+
+local tbl = require("santoku.table")
+local teq = tbl.equals
+
+local validate = require("santoku.validate")
+local eq = validate.isequal
 
 local sql = require("santoku.sqlite")
 
-test("sqlite", function ()
+local iter = require("santoku.iter")
+local collect = iter.collect
+local take = iter.take
 
-  test("should wrap various functions", function ()
+test("should wrap various functions", function ()
 
-    local ok, db = sql.open_memory()
-    assert.equals(true, ok)
+  local db = sql.open_memory()
 
-    local ok, run_ddl = db:runner([[
-      create table cities (
-        name text,
-        state text
-      );
-    ]])
-    assert.equals(true, ok, run_ddl)
+  local run_ddl = db.runner([[
+    create table cities (
+      name text,
+      state text
+    );
+  ]])
 
-    local ok, res = run_ddl()
-    assert.equals(true, ok, res)
-    assert.is_nil(res)
+  run_ddl()
 
-    local ok, addcity = db:runner([[
-      insert into cities (name, state) values (?, ?)
-    ]])
-    assert.equals(true, ok, addcity)
+  local addcity = db.runner([[
+    insert into cities (name, state) values (?, ?)
+  ]])
 
-    local ok, val = addcity("New York", "New York")
-    assert.equals(true, ok)
-    assert.is_nil(val)
+  addcity("New York", "New York")
+  addcity("Buffalo", "New York")
+  addcity("Albany", "New York")
+  addcity("Tampa", "Florida")
+  addcity("Miami", "Florida")
 
-    local ok, val = addcity("Buffalo", "New York")
-    assert.equals(true, ok)
-    assert.is_nil(val)
+  local getcity = db.getter([[
+    select * from cities where name = ?
+  ]])
 
-    local ok, val = addcity("Albany", "New York")
-    assert.equals(true, ok)
-    assert.is_nil(val)
+  local city = getcity("Tampa")
+  assert(teq(city, { name = "Tampa", state = "Florida" }))
 
-    local ok, val = addcity("Tampa", "Florida")
-    assert.equals(true, ok)
-    assert.is_nil(val)
+  local city = getcity("Albany")
+  assert(teq(city, { name = "Albany", state = "New York" }))
 
-    local ok, val = addcity("Miami", "Florida")
-    assert.equals(true, ok)
-    assert.is_nil(val)
+  local getcitystate = db.getter([[
+    select * from cities where name = ?
+  ]], "state")
 
-    local ok, getcity = db:getter([[
-      select * from cities where name = ?
-    ]])
-    assert.equals(true, ok, getcity)
+  local state = getcitystate("Albany")
+  assert(eq(state, "New York"))
 
-    local ok, city = getcity("Tampa")
-    assert.equals(true, ok)
-    assert.same(city, { name = "Tampa", state = "Florida" })
+  local getstates = db.iter([[
+    select * from cities
+  ]])
 
-    local ok, city = getcity("Albany")
-    assert.equals(true, ok)
-    assert.same(city, { name = "Albany", state = "New York" })
+  assert(teq(collect(getstates()), {
+    { name = "New York", state = "New York" },
+    { name = "Buffalo", state = "New York" },
+    { name = "Albany", state = "New York" },
+    { name = "Tampa", state = "Florida" },
+    { name = "Miami", state = "Florida" },
+  }))
 
-    local ok, getcitystate = db:getter([[
-      select * from cities where name = ?
-    ]], "state")
-    assert.equals(true, ok, getcitystate)
+  local allstates = db.all([[
+    select * from cities
+  ]])
 
-    local ok, state = getcitystate("Albany")
-    assert.equals(true, ok)
-    assert.same(state, "New York")
+  assert(teq(allstates(), {
+    { name = "New York", state = "New York" },
+    { name = "Buffalo", state = "New York" },
+    { name = "Albany", state = "New York" },
+    { name = "Tampa", state = "Florida" },
+    { name = "Miami", state = "Florida" },
+  }))
 
-    local ok, getstates = db:iter([[
-      select * from cities
-    ]])
-    assert.equals(true, ok, getstates)
+end)
 
-    local ok, states = getstates()
-    assert.equals(true, ok, states)
+test("should handle multiple iterators", function ()
 
-    states = states:vec()
-    assert.same(states[1], { true, { name = "New York", state = "New York" }, n = 2 })
-    assert.same(states[2], { true, { name = "Buffalo", state = "New York" }, n = 2 })
-    assert.same(states[3], { true, { name = "Albany", state = "New York" }, n = 2 })
-    assert.equals(states.n, 5)
+  local db = sql.open_memory()
 
-    local ok, allstates = db:all([[
-      select * from cities
-    ]])
-    assert.equals(true, ok, allstates)
+  db.exec([[
+    create table numbers (
+      n integer
+    );
+  ]])
 
-    local ok, states = allstates()
-    assert.equals(true, ok, states)
+  local addn = db.inserter([[
+    insert into numbers (n) values (?)
+  ]])
 
-    assert.same(states[1], { name = "New York", state = "New York" })
-    assert.same(states[2], { name = "Buffalo", state = "New York" })
-    assert.same(states[3], { name = "Albany", state = "New York" })
-    assert.equals(states.n, 5)
+  for i = 1, 100 do
+    addn(i)
+  end
 
-  end)
+  local getns = db.iter([[
+    select * from numbers
+  ]])
 
-  test("should handle co iterators", function ()
+  local as = collect(take(2, getns()))
+  local bs = collect(take(2, getns()))
 
-    local db = check(sql.open_memory())
+  assert(teq(as, bs))
 
-    check(db:exec([[
-      create table numbers (
-        n integer
-      );
-    ]]))
+end)
 
-    local addn = check(db:inserter([[
-      insert into numbers (n) values (?)
-    ]]))
+test("should handle with clauses", function ()
 
-    for i = 1, 100 do
-      check(addn(i))
-    end
+  local db = sql.open_memory()
 
-    local getns = check(db:iter([[
-      select * from numbers
-    ]]))
+  db.exec([[
+    create table numbers (
+      n integer
+    );
+  ]])
 
-    local as = check(getns()):co():take(2):map(check):vec()
-    local bs = check(getns()):co():take(2):map(check):vec()
+  local addn = db.inserter([[
+    insert into numbers (n) values (?)
+  ]])
 
-    assert.same(as, bs)
+  for i = 1, 100 do
+    addn(i)
+  end
 
-  end)
+  local getns = db.getter([[
+    with evens as (select * from numbers where n % 2 == 0)
+    select n from evens
+    order by n desc
+  ]])
 
-  test("should handle with clauses", function ()
-
-    local db = check(sql.open_memory())
-
-    check(db:exec([[
-      create table numbers (
-        n integer
-      );
-    ]]))
-
-    local addn = check(db:inserter([[
-      insert into numbers (n) values (?)
-    ]]))
-
-    for i = 1, 100 do
-      check(addn(i))
-    end
-
-    local getns = check(db:getter([[
-      with evens as (select * from numbers where n % 2 == 0)
-      select n from evens
-      order by n desc
-    ]]))
-
-    assert.same({ true, { n = 100 } }, { getns() })
-
-  end)
+  assert(teq({ n = 100 }, getns()))
 
 end)
