@@ -50,7 +50,7 @@ local function query (db, stmt, ...)
     elseif res == sqlite.DONE then
       return
     else
-      return error(db.db:errmsg(), db.db:errcode())
+      return error(db:errmsg(), db:errcode())
     end
   end
 end
@@ -65,7 +65,7 @@ local function get_one (db, stmt, ...)
   elseif res == sqlite.DONE then
     return
   else
-    return error(db.db:errmsg(), db.db:errcode())
+    return error(db:errmsg(), db:errcode())
   end
 end
 
