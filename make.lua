@@ -1,14 +1,14 @@
 local env = {
 
   name = "santoku-sqlite",
-  version = "0.0.11-1",
+  version = "0.0.12-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,
 
   dependencies = {
     "lua >= 5.1",
-    "santoku >= 0.0.189-1",
+    "santoku >= 0.0.191-1",
     "lsqlite3 >= 0.9.5",
   },
 

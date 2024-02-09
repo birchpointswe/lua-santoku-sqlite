@@ -2,9 +2,11 @@ local sqlite = require("lsqlite3")
 
 local err = require("santoku.error")
 local error = err.error
+local pcall = err.pcall
 
 local varg = require("santoku.varg")
 local vlen = varg.len
+local vtup = varg.tup
 
 local iter = require("santoku.iter")
 local last = iter.last
@@ -77,29 +79,46 @@ local function get_val (db, stmt, prop, ...)
 end
 
 local function wrap (db)
+
+  local function begin ()
+    local res = db:exec("begin;")
+    if res ~= sqlite.OK then
+      error(db:errmsg(), db:errcode())
+    end
+  end
+
+  local function commit ()
+    local res = db:exec("commit;")
+    if res ~= sqlite.OK then
+      error(db:errmsg(), db:errcode())
+    end
+  end
+
+  local function rollback ()
+    local res = db:exec("rollback;")
+    if res ~= sqlite.OK then
+      error(db:errmsg(), db:errcode())
+    end
+  end
+
   return {
 
     db = db,
+    begin = begin,
+    commit = commit,
+    rollback = rollback,
 
-    begin = function ()
-      local res = db:exec("begin;")
-      if res ~= sqlite.OK then
-        error(db:errmsg(), db:errcode())
-      end
-    end,
-
-    commit = function ()
-      local res = db:exec("commit;")
-      if res ~= sqlite.OK then
-        error(db:errmsg(), db:errcode())
-      end
-    end,
-
-    rollback = function ()
-      local res = db:exec("rollback;")
-      if res ~= sqlite.OK then
-        error(db:errmsg(), db:errcode())
-      end
+    transaction = function (fn, ...)
+      begin()
+      return vtup(function (ok, ...)
+        if not ok then
+          rollback()
+          error(...)
+        else
+          commit()
+          return ...
+        end
+      end, pcall(fn, ...))
     end,
 
     exec = function (...)
