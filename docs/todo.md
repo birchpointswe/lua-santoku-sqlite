@@ -1,6 +1,7 @@
 # Now
 
 - Allow prop for all and iter
+- Instead of get_named_values, return an iterator over columns
 
 - Support sqlite "in" cluase with json_each
 - Support iter:clone()/recompile for
