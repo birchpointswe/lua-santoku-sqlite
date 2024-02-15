@@ -1,5 +1,3 @@
-local sqlite = require("lsqlite3")
-
 local err = require("santoku.error")
 local error = err.error
 local pcall = err.pcall
@@ -15,6 +13,8 @@ local collect = iter.collect
 local validate = require("santoku.validate")
 local isprimitive = validate.isprimitive
 local hasindex = validate.hasindex
+
+local OK, ROW, DONE = 0, 100, 101
 
 local function check (db, res, code, msg)
   if not res then
@@ -47,9 +47,9 @@ local function query (db, stmt, ...)
   bind(stmt, ...)
   return function ()
     local res = stmt:step()
-    if res == sqlite.ROW then
+    if res == ROW then
       return stmt:get_named_values()
-    elseif res == sqlite.DONE then
+    elseif res == DONE then
       return
     else
       return error(db:errmsg(), db:errcode())
@@ -61,10 +61,10 @@ local function get_one (db, stmt, ...)
   stmt:reset()
   bind(stmt, ...)
   local res = stmt:step()
-  if res == sqlite.ROW then
+  if res == ROW then
     local val = stmt:get_named_values()
     return val
-  elseif res == sqlite.DONE then
+  elseif res == DONE then
     return
   else
     return error(db:errmsg(), db:errcode())
@@ -78,25 +78,27 @@ local function get_val (db, stmt, prop, ...)
   end
 end
 
-local function wrap (db)
+local function wrap (...)
+
+  local db = check(nil, ...)
 
   local function begin ()
     local res = db:exec("begin;")
-    if res ~= sqlite.OK then
+    if res ~= OK then
       error(db:errmsg(), db:errcode())
     end
   end
 
   local function commit ()
     local res = db:exec("commit;")
-    if res ~= sqlite.OK then
+    if res ~= OK then
       error(db:errmsg(), db:errcode())
     end
   end
 
   local function rollback ()
     local res = db:exec("rollback;")
-    if res ~= sqlite.OK then
+    if res ~= OK then
       error(db:errmsg(), db:errcode())
     end
   end
@@ -123,7 +125,7 @@ local function wrap (db)
 
     exec = function (...)
       local res = db:exec(...)
-      if res ~= sqlite.OK then
+      if res ~= OK then
         error(db:errmsg(), db:errcode())
       end
     end,
@@ -173,21 +175,4 @@ local function wrap (db)
   }
 end
 
-local function open (...)
-  return wrap(check(nil, sqlite.open(...)))
-end
-
-local function open_memory (...)
-  return wrap(check(nil, sqlite.open_memory(...)))
-end
-
-local function open_ptr (...)
-  return wrap(check(nil, sqlite.open_ptr(...)))
-end
-
-return {
-  open = open,
-  open_memory = open_memory,
-  open_ptr = open_ptr,
-  wrap = wrap,
-}
+return wrap

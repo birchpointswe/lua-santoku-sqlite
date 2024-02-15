@@ -10,6 +10,7 @@ local teq = tbl.equals
 local validate = require("santoku.validate")
 local eq = validate.isequal
 
+local sqlite = require("lsqlite3")
 local sql = require("santoku.sqlite")
 
 local iter = require("santoku.iter")
@@ -18,7 +19,7 @@ local take = iter.take
 
 test("should wrap various functions", function ()
 
-  local db = sql.open_memory()
+  local db = sql(sqlite.open_memory())
 
   local run_ddl = db.runner([[
     create table cities (
@@ -84,7 +85,7 @@ end)
 
 test("should handle multiple iterators", function ()
 
-  local db = sql.open_memory()
+  local db = sql(sqlite.open_memory())
 
   db.exec([[
     create table numbers (
@@ -113,7 +114,7 @@ end)
 
 test("should handle with clauses", function ()
 
-  local db = sql.open_memory()
+  local db = sql(sqlite.open_memory())
 
   db.exec([[
     create table numbers (
