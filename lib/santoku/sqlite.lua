@@ -30,6 +30,19 @@ local function check (db, res, code, msg)
   end
 end
 
+local function reset (db, stmt)
+  local res = stmt:reset()
+  if res ~= OK then
+    error(db:errmsg(), db:errcode())
+  end
+end
+
+local function resetter (db, stmt)
+  return function ()
+    reset(db, stmt)
+  end
+end
+
 local function bind (stmt, ...)
   if vlen(...) == 0 then
     return stmt
@@ -43,30 +56,34 @@ local function bind (stmt, ...)
 end
 
 local function query (db, stmt, ...)
-  stmt:reset()
+  reset(db, stmt)
   bind(stmt, ...)
   return function ()
     local res = stmt:step()
     if res == ROW then
       return stmt:get_named_values()
     elseif res == DONE then
+      reset(db, stmt)
       return
     else
+      reset(db, stmt)
       return error(db:errmsg(), db:errcode())
     end
   end
 end
 
 local function get_one (db, stmt, ...)
-  stmt:reset()
   bind(stmt, ...)
   local res = stmt:step()
   if res == ROW then
     local val = stmt:get_named_values()
+    reset(db, stmt)
     return val
   elseif res == DONE then
+    reset(db, stmt)
     return
   else
+    reset(db, stmt)
     return error(db:errmsg(), db:errcode())
   end
 end
@@ -74,8 +91,11 @@ end
 local function get_val (db, stmt, prop, ...)
   local val = get_one(db, stmt, ...)
   if val then
-    return val[prop]
+    local r = val[prop]
+    reset(db, stmt)
+    return r
   end
+  reset(db, stmt)
 end
 
 local function wrap (...)
@@ -134,7 +154,7 @@ local function wrap (...)
       local stmt = check(db, db:prepare(sql))
       return function (...)
         return query(db, stmt, ...)
-      end
+      end, resetter(db, stmt)
     end,
 
     all = function (sql)
