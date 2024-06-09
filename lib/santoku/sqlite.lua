@@ -32,7 +32,7 @@ end
 
 local function reset (db, stmt)
   local res = stmt:reset()
-  if res ~= OK then
+  if not (res == OK or res == ROW or res == DONE) then
     error(db:errmsg(), db:errcode())
   end
 end
