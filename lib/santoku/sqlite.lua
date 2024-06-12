@@ -4,6 +4,7 @@ local pcall = err.pcall
 
 local varg = require("santoku.varg")
 local vlen = varg.len
+local vsel = varg.sel
 local vtup = varg.tup
 
 local iter = require("santoku.iter")
@@ -102,8 +103,10 @@ local function wrap (...)
 
   local db = check(nil, ...)
 
-  local function begin ()
-    local res = db:exec("begin;")
+  local function begin (t)
+    local res = db:exec(t
+      and ("begin " .. t .. ";")
+      or ("begin immediate;"))
     if res ~= OK then
       error(db:errmsg(), db:errcode())
     end
@@ -131,7 +134,14 @@ local function wrap (...)
     rollback = rollback,
 
     transaction = function (fn, ...)
-      begin()
+      local idx = 1
+      if type(fn) == "string" then
+        begin(fn)
+        fn = (...)
+        idx = 2
+      else
+        begin()
+      end
       return vtup(function (ok, ...)
         if not ok then
           rollback()
@@ -140,7 +150,7 @@ local function wrap (...)
           commit()
           return ...
         end
-      end, pcall(fn, ...))
+      end, pcall(fn, vsel(idx, ...)))
     end,
 
     exec = function (...)

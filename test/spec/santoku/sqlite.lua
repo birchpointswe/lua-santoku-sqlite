@@ -97,9 +97,12 @@ test("should handle multiple iterators", function ()
     insert into numbers (n) values (?)
   ]])
 
-  for i = 1, 100 do
-    addn(i)
-  end
+  db.transaction("deferred", function (a, b, c)
+    assert(teq({ a, b, c }, { 1, 2, 3 }))
+    for i = 1, 100 do
+      addn(i)
+    end
+  end, 1, 2, 3)
 
   local getns = db.iter([[
     select * from numbers
@@ -126,9 +129,12 @@ test("should handle with clauses", function ()
     insert into numbers (n) values (?)
   ]])
 
-  for i = 1, 100 do
-    addn(i)
-  end
+  db.transaction(function (a, b, c)
+    assert(teq({ a, b, c }, { 1, 2, 3 }))
+    for i = 1, 100 do
+      addn(i)
+    end
+  end, 1, 2, 3)
 
   local getns = db.getter([[
     with evens as (select * from numbers where n % 2 == 0)
