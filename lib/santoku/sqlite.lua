@@ -126,6 +126,10 @@ local function wrap (...)
     end
   end
 
+
+
+  local transaction_active = false
+
   return {
 
     db = db,
@@ -135,22 +139,28 @@ local function wrap (...)
 
     transaction = function (fn, ...)
       local idx = 1
+      local tag = nil
       if type(fn) == "string" then
-        begin(fn)
+        tag = fn
         fn = (...)
         idx = 2
-      else
-        begin()
       end
-      return vtup(function (ok, ...)
-        if not ok then
-          rollback()
-          error(...)
-        else
-          commit()
-          return ...
-        end
-      end, pcall(fn, vsel(idx, ...)))
+      if not transaction_active then
+        begin(tag)
+        transaction_active = true
+        return vtup(function (ok, ...)
+          transaction_active = false
+          if not ok then
+            rollback()
+            error(...)
+          else
+            commit()
+            return ...
+          end
+        end, pcall(fn, vsel(idx, ...)))
+      else
+        return fn(vsel(idx, ...))
+      end
     end,
 
     exec = function (...)
