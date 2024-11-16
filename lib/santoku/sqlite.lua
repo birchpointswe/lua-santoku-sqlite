@@ -207,7 +207,7 @@ local function wrap (...)
     inserter = function (sql)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        get_one(db, stmt, ...)
+        last(query(db, stmt, ...))
         return db:last_insert_rowid()
       end
     end,

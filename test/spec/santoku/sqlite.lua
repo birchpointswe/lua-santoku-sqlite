@@ -100,7 +100,8 @@ test("should handle multiple iterators", function ()
   db.transaction("deferred", function (a, b, c)
     assert(teq({ a, b, c }, { 1, 2, 3 }))
     for i = 1, 100 do
-      addn(i)
+      local x = addn(i)
+      assert(teq({ x }, { i }))
     end
   end, 1, 2, 3)
 
@@ -132,7 +133,8 @@ test("should handle with clauses", function ()
   db.transaction(function (a, b, c)
     assert(teq({ a, b, c }, { 1, 2, 3 }))
     for i = 1, 100 do
-      addn(i)
+      local x = addn(i)
+      assert(teq({ x }, { i }))
     end
   end, 1, 2, 3)
 
