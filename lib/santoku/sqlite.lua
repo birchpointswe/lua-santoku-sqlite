@@ -40,9 +40,7 @@ local function resetter (db, stmt)
 end
 
 local function bind (stmt, ...)
-  if (...) == nil then
-    return
-  elseif type(...) == "table" then
+  if ... and type(...) == "table" then
     return stmt:bind_names((...))
   else
     return stmt:bind_values(...)
