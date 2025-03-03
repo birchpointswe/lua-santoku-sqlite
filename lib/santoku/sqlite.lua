@@ -3,17 +3,12 @@ local error = err.error
 local pcall = err.pcall
 
 local varg = require("santoku.varg")
-local vlen = varg.len
 local vsel = varg.sel
 local vtup = varg.tup
 
 local iter = require("santoku.iter")
 local last = iter.last
 local collect = iter.collect
-
-local validate = require("santoku.validate")
-local isprimitive = validate.isprimitive
-local hasindex = validate.hasindex
 
 local OK, ROW, DONE = 0, 100, 101
 
@@ -45,24 +40,33 @@ local function resetter (db, stmt)
 end
 
 local function bind (stmt, ...)
-  if vlen(...) == 0 then
-    return stmt
-  end
-  local t = ...
-  if not isprimitive(t) and hasindex(t) then
-    return stmt:bind_names(t)
+  if (...) == nil then
+    return
+  elseif type(...) == "table" then
+    return stmt:bind_names((...))
   else
     return stmt:bind_values(...)
   end
 end
 
-local function query (db, stmt, ...)
+local function query (db, stmt, prop, ...)
   reset(db, stmt)
   bind(stmt, ...)
   return function ()
     local res = stmt:step()
     if res == ROW then
-      return stmt:get_named_values()
+      if prop == false then
+        return
+      elseif type(prop) == "number" then
+        return stmt:get_value(prop)
+      else
+        local val = stmt:get_named_values()
+        if val and prop ~= nil then
+          return val[prop]
+        else
+          return val
+        end
+      end
     elseif res == DONE then
       reset(db, stmt)
       return
@@ -73,13 +77,25 @@ local function query (db, stmt, ...)
   end
 end
 
-local function get_one (db, stmt, ...)
+local function get_one (db, stmt, prop, ...)
   bind(stmt, ...)
   local res = stmt:step()
   if res == ROW then
-    local val = stmt:get_named_values()
-    reset(db, stmt)
-    return val
+    if prop == false then
+      reset(db, stmt)
+      return
+    elseif type(prop) == "number" then
+      local val = stmt:get_value(prop)
+      reset(db, stmt)
+      return val
+    else
+      local val = stmt:get_named_values()
+      if val and prop ~= nil then
+        val = val[prop]
+      end
+      reset(db, stmt)
+      return val
+    end
   elseif res == DONE then
     reset(db, stmt)
     return
@@ -87,16 +103,6 @@ local function get_one (db, stmt, ...)
     reset(db, stmt)
     return error(db:errmsg(), db:errcode())
   end
-end
-
-local function get_val (db, stmt, prop, ...)
-  local val = get_one(db, stmt, ...)
-  if val then
-    local r = val[prop]
-    reset(db, stmt)
-    return r
-  end
-  reset(db, stmt)
 end
 
 local function wrap (...)
@@ -170,44 +176,38 @@ local function wrap (...)
       end
     end,
 
-    iter = function (sql)
+    iter = function (sql, prop)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        return query(db, stmt, ...)
+        return query(db, stmt, prop, ...)
       end, resetter(db, stmt)
     end,
 
-    all = function (sql)
+    all = function (sql, prop)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        return collect(query(db, stmt, ...))
+        return collect(query(db, stmt, prop, ...))
       end
     end,
 
     runner = function (sql)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        return last(query(db, stmt, ...))
+        return last(query(db, stmt, false, ...))
       end
     end,
 
     getter = function (sql, prop)
       local stmt = check(db, db:prepare(sql))
-      if prop then
-        return function (...)
-          return get_val(db, stmt, prop, ...)
-        end
-      else
-        return function (...)
-          return get_one(db, stmt, ...)
-        end
+      return function (...)
+        return get_one(db, stmt, prop, ...)
       end
     end,
 
     inserter = function (sql)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        last(query(db, stmt, ...))
+        get_one(db, stmt, false, ...)
         return db:last_insert_rowid()
       end
     end,
