@@ -6,10 +6,6 @@ local varg = require("santoku.varg")
 local vsel = varg.sel
 local vtup = varg.tup
 
-local iter = require("santoku.iter")
-local last = iter.last
-local collect = iter.collect
-
 local OK, ROW, DONE = 0, 100, 101
 
 local function check (db, res, code, msg)
@@ -46,6 +42,35 @@ local function bind (stmt, ...)
     return stmt:bind_values(...)
   end
 end
+
+local function run (db, stmt, prop, out, ...)
+  reset(db, stmt)
+  bind(stmt, ...)
+  while true do
+    local res = stmt:step()
+    if res == ROW then -- luacheck: ignore
+      if out then
+        if type(prop) == "number" then
+          out[#out + 1] = stmt:get_value(prop)
+        else
+          local val = stmt:get_named_values()
+          if val and prop ~= nil then
+            out[#out + 1] = val[prop]
+          else
+            out[#out + 1] = val
+          end
+        end
+      end
+    elseif res == DONE then
+      reset(db, stmt)
+      return out
+    else
+      reset(db, stmt)
+      return error(db:errmsg(), db:errcode())
+    end
+  end
+end
+
 
 local function query (db, stmt, prop, ...)
   reset(db, stmt)
@@ -184,14 +209,14 @@ local function wrap (...)
     all = function (sql, prop)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        return collect(query(db, stmt, prop, ...))
+        return run(db, stmt, prop, {}, ...)
       end
     end,
 
     runner = function (sql)
       local stmt = check(db, db:prepare(sql))
       return function (...)
-        return last(query(db, stmt, false, ...))
+        return run(db, stmt, nil, nil, ...)
       end
     end,
 
