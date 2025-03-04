@@ -155,6 +155,14 @@ local function wrap (...)
     end
   end
 
+  local function close ()
+    db:close_vm()
+    local res = db:close()
+    if res ~= OK then
+      error(db:errmsg(), db:errcode())
+    end
+  end
+
 
 
   local transaction_active = false
@@ -162,6 +170,7 @@ local function wrap (...)
   return {
 
     db = db,
+    close = close,
     begin = begin,
     commit = commit,
     rollback = rollback,
