@@ -163,8 +163,6 @@ local function wrap (...)
     end
   end
 
-
-
   local transaction_active = false
 
   return {
