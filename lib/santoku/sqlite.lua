@@ -100,6 +100,17 @@ local function query (db, stmt, prop, ...)
   end
 end
 
+local function spread_finalize (n, db, stmt, ...)
+  if n <= 0 then
+    reset(db, stmt)
+    return ...
+  else
+    n = n - 1
+    local nval = stmt:get_value(n)
+    return spread_finalize(n, db, stmt, nval, ...)
+  end
+end
+
 local function get_one (db, stmt, prop, ...)
   bind(stmt, ...)
   local res = stmt:step()
@@ -107,17 +118,16 @@ local function get_one (db, stmt, prop, ...)
     if prop == false then
       reset(db, stmt)
       return
+    elseif prop == true then
+      local val = stmt:get_named_values()
+      reset(db, stmt)
+      return val
     elseif type(prop) == "number" then
-      local val = stmt:get_value(prop)
+      local val = stmt:get_value(prop - 1)
       reset(db, stmt)
       return val
     else
-      local val = stmt:get_named_values()
-      if val and prop ~= nil then
-        val = val[prop]
-      end
-      reset(db, stmt)
-      return val
+      return spread_finalize(stmt:columns(), db, stmt)
     end
   elseif res == DONE then
     reset(db, stmt)

@@ -42,7 +42,7 @@ test("should wrap various functions", function ()
 
   local getcity = db.getter([[
     select * from cities where name = ?
-  ]])
+  ]], true)
 
   local city = getcity("Tampa")
   assert(teq(city, { name = "Tampa", state = "Florida" }))
@@ -51,8 +51,8 @@ test("should wrap various functions", function ()
   assert(teq(city, { name = "Albany", state = "New York" }))
 
   local getcitystate = db.getter([[
-    select * from cities where name = ?
-  ]], "state")
+    select state from cities where name = ?
+  ]])
 
   local state = getcitystate("Albany")
   assert(eq(state, "New York"))
@@ -144,7 +144,7 @@ test("should handle with clauses", function ()
     order by n desc
   ]])
 
-  assert(teq({ n = 100 }, getns()))
+  assert(teq({ 100 }, { getns() }))
 
 end)
 
