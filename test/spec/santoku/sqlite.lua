@@ -59,7 +59,7 @@ test("should wrap various functions", function ()
 
   local getstates = db.iter([[
     select * from cities
-  ]])
+  ]], true)
 
   assert(teq(collect(getstates()), {
     { name = "New York", state = "New York" },
@@ -71,7 +71,7 @@ test("should wrap various functions", function ()
 
   local allstates = db.all([[
     select * from cities
-  ]])
+  ]], true)
 
   assert(teq(allstates(), {
     { name = "New York", state = "New York" },

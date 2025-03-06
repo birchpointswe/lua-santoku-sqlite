@@ -16,7 +16,7 @@ local function check (db, res, code, msg)
     if not code and db then
       code = db:errcode()
     end
-    error(msg, code)
+    return error(msg, code)
   else
     return res
   end
@@ -25,13 +25,13 @@ end
 local function reset (db, stmt)
   local res = stmt:reset()
   if not (res == OK or res == ROW or res == DONE) then
-    error(db:errmsg(), db:errcode())
+    return error(db:errmsg(), db:errcode())
   end
 end
 
 local function resetter (db, stmt)
   return function ()
-    reset(db, stmt)
+    return reset(db, stmt)
   end
 end
 
@@ -43,22 +43,34 @@ local function bind (stmt, ...)
   end
 end
 
+local function spread_finalize (n, db, stmt, should_reset, ...)
+  if n <= 0 then
+    if should_reset then
+      reset(db, stmt)
+    end
+    return ...
+  else
+    n = n - 1
+    local nval = stmt:get_value(n)
+    return spread_finalize(n, db, stmt, should_reset, nval, ...)
+  end
+end
+
 local function run (db, stmt, prop, out, ...)
   reset(db, stmt)
   bind(stmt, ...)
   while true do
     local res = stmt:step()
     if res == ROW then -- luacheck: ignore
-      if out then
-        if type(prop) == "number" then
-          out[#out + 1] = stmt:get_value(prop)
-        else
+      if out and prop ~= false then
+        if prop == true then
           local val = stmt:get_named_values()
-          if val and prop ~= nil then
-            out[#out + 1] = val[prop]
-          else
-            out[#out + 1] = val
-          end
+          out[#out + 1] = val
+        elseif type(prop) == "number" then
+          local val = stmt:get_value(prop - 1)
+          out[#out + 1] = val
+        else
+          return { spread_finalize(stmt:columns(), db, stmt, false) }
         end
       end
     elseif res == DONE then
@@ -80,34 +92,17 @@ local function query (db, stmt, prop, ...)
     if res == ROW then
       if prop == false then
         return
-      elseif type(prop) == "number" then
-        return stmt:get_value(prop)
+      elseif prop == true then
+        return stmt:get_named_values()
       else
-        local val = stmt:get_named_values()
-        if val and prop ~= nil then
-          return val[prop]
-        else
-          return val
-        end
+        return spread_finalize(stmt:columns(), db, stmt, false)
       end
     elseif res == DONE then
-      reset(db, stmt)
-      return
+      return reset(db, stmt)
     else
       reset(db, stmt)
       return error(db:errmsg(), db:errcode())
     end
-  end
-end
-
-local function spread_finalize (n, db, stmt, ...)
-  if n <= 0 then
-    reset(db, stmt)
-    return ...
-  else
-    n = n - 1
-    local nval = stmt:get_value(n)
-    return spread_finalize(n, db, stmt, nval, ...)
   end
 end
 
@@ -116,22 +111,16 @@ local function get_one (db, stmt, prop, ...)
   local res = stmt:step()
   if res == ROW then
     if prop == false then
-      reset(db, stmt)
-      return
+      return reset(db, stmt)
     elseif prop == true then
       local val = stmt:get_named_values()
       reset(db, stmt)
       return val
-    elseif type(prop) == "number" then
-      local val = stmt:get_value(prop - 1)
-      reset(db, stmt)
-      return val
     else
-      return spread_finalize(stmt:columns(), db, stmt)
+      return spread_finalize(stmt:columns(), db, stmt, true)
     end
   elseif res == DONE then
-    reset(db, stmt)
-    return
+    return reset(db, stmt)
   else
     reset(db, stmt)
     return error(db:errmsg(), db:errcode())
