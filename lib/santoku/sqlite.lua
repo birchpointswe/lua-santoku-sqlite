@@ -66,11 +66,9 @@ local function run (db, stmt, prop, out, ...)
         if prop == true then
           local val = stmt:get_named_values()
           out[#out + 1] = val
-        elseif type(prop) == "number" then
-          local val = stmt:get_value(prop - 1)
+        elseif stmt:columns() > 0 then
+          local val = stmt:get_value(0)
           out[#out + 1] = val
-        else
-          return { spread_finalize(stmt:columns(), db, stmt, false) }
         end
       end
     elseif res == DONE then
