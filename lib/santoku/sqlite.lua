@@ -162,6 +162,32 @@ local function wrap (...)
 
   local transaction_active = false
 
+  local function transaction (fn, ...)
+    local idx = 1
+    local tag = nil
+    if type(fn) == "string" then
+      tag = fn
+      fn = (...)
+      idx = 2
+    end
+    if not transaction_active then
+      begin(tag)
+      transaction_active = true
+      return vtup(function (ok, ...)
+        transaction_active = false
+        if not ok then
+          rollback()
+          error(...)
+        else
+          commit()
+          return ...
+        end
+      end, pcall(fn, vsel(idx, ...)))
+    else
+      return fn(vsel(idx, ...))
+    end
+  end
+
   return {
 
     db = db,
@@ -170,73 +196,59 @@ local function wrap (...)
     commit = commit,
     rollback = rollback,
 
-    transaction = function (fn, ...)
-      local idx = 1
-      local tag = nil
-      if type(fn) == "string" then
-        tag = fn
-        fn = (...)
-        idx = 2
-      end
-      if not transaction_active then
-        begin(tag)
-        transaction_active = true
-        return vtup(function (ok, ...)
-          transaction_active = false
-          if not ok then
-            rollback()
-            error(...)
-          else
-            commit()
-            return ...
-          end
-        end, pcall(fn, vsel(idx, ...)))
-      else
-        return fn(vsel(idx, ...))
-      end
-    end,
+    transaction = transaction,
 
     exec = function (...)
       local res = db:exec(...)
       if res ~= OK then
-        error(db:errmsg(), db:errcode())
+        error(db:errmsg(), db:errcode(), "error in exec", ...)
       end
     end,
 
     iter = function (sql, prop)
-      local stmt = check(db, db:prepare(sql))
-      return function (...)
-        return query(db, stmt, prop, ...)
-      end, resetter(db, stmt)
+      return transaction(function ()
+        local stmt = check(db, db:prepare(sql), "error in iter")
+        return function (...)
+          return query(db, stmt, prop, ...)
+        end, resetter(db, stmt)
+      end)
     end,
 
     all = function (sql, prop)
-      local stmt = check(db, db:prepare(sql))
-      return function (...)
-        return run(db, stmt, prop, {}, ...)
-      end
+      return transaction(function ()
+        local stmt = check(db, db:prepare(sql), "error in all")
+        return function (...)
+          return run(db, stmt, prop, {}, ...)
+        end
+      end)
     end,
 
     runner = function (sql)
-      local stmt = check(db, db:prepare(sql))
-      return function (...)
-        return run(db, stmt, nil, nil, ...)
-      end
+      return transaction(function ()
+        local stmt = check(db, db:prepare(sql), "error in runner")
+        return function (...)
+          return run(db, stmt, nil, nil, ...)
+        end
+      end)
     end,
 
     getter = function (sql, prop)
-      local stmt = check(db, db:prepare(sql))
-      return function (...)
-        return get_one(db, stmt, prop, ...)
-      end
+      return transaction(function ()
+        local stmt = check(db, db:prepare(sql), "error in getter")
+        return function (...)
+          return get_one(db, stmt, prop, ...)
+        end
+      end)
     end,
 
     inserter = function (sql)
-      local stmt = check(db, db:prepare(sql))
-      return function (...)
-        get_one(db, stmt, false, ...)
-        return db:last_insert_rowid()
-      end
+      return transaction(function ()
+        local stmt = check(db, db:prepare(sql), "error in inserter")
+        return function (...)
+          get_one(db, stmt, false, ...)
+          return db:last_insert_rowid()
+        end
+      end)
     end,
 
   }
