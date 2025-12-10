@@ -13,9 +13,8 @@ local eq = validate.isequal
 local sqlite = require("lsqlite3")
 local sql = require("santoku.sqlite")
 
-local iter = require("santoku.iter")
-local collect = iter.collect
-local take = iter.take
+local arr = require("santoku.array")
+local apull = arr.pull
 
 test("should wrap various functions", function ()
 
@@ -61,7 +60,7 @@ test("should wrap various functions", function ()
     select * from cities
   ]], true)
 
-  assert(teq(collect(getstates()), {
+  assert(teq(apull(getstates()), {
     { name = "New York", state = "New York" },
     { name = "Buffalo", state = "New York" },
     { name = "Albany", state = "New York" },
@@ -109,8 +108,8 @@ test("should handle multiple iterators", function ()
     select * from numbers
   ]])
 
-  local as = collect(take(2, getns()))
-  local bs = collect(take(2, getns()))
+  local as = apull(getns(), 2)
+  local bs = apull(getns(), 2)
 
   assert(teq(as, bs))
 

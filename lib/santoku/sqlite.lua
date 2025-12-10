@@ -2,10 +2,6 @@ local err = require("santoku.error")
 local error = err.error
 local pcall = err.pcall
 
-local varg = require("santoku.varg")
-local vsel = varg.sel
-local vtup = varg.tup
-
 local OK, ROW, DONE = 0, 100, 101
 
 local function check (db, res, code, msg)
@@ -173,7 +169,7 @@ local function wrap (...)
     if not transaction_active then
       begin(tag)
       transaction_active = true
-      return vtup(function (ok, ...)
+      return (function (ok, ...)
         transaction_active = false
         if not ok then
           rollback()
@@ -182,9 +178,9 @@ local function wrap (...)
           commit()
           return ...
         end
-      end, pcall(fn, vsel(idx, ...)))
+      end)(pcall(fn, select(idx, ...)))
     else
-      return fn(vsel(idx, ...))
+      return fn(select(idx, ...))
     end
   end
 
