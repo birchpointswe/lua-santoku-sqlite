@@ -10,7 +10,7 @@ local teq = tbl.equals
 local validate = require("santoku.validate")
 local eq = validate.isequal
 
-local sqlite = require("lsqlite3")
+local sqlite = require("santoku.sqlite.db")
 local sql = require("santoku.sqlite")
 
 local arr = require("santoku.array")
