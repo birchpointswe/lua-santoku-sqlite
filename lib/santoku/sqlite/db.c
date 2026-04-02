@@ -246,6 +246,195 @@ static int stmt_get_named_values (lua_State *L) {
   return 1;
 }
 
+#define TK_CA_INT32  0
+#define TK_CA_INT64  1
+#define TK_CA_DOUBLE 2
+#define TK_CA_FLOAT  3
+
+typedef struct { void *ptr; int cnt; int type; } tk_ca_bind;
+
+static void tk_ca_bind_free (void *p) { free(p); }
+
+typedef struct { sqlite3_vtab base; } tk_ca_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  int row, cnt, type;
+  void *ptr;
+} tk_ca_cur;
+
+static int tk_ca_connect (sqlite3 *db, void *pAux, int argc,
+    const char *const *argv, sqlite3_vtab **ppVtab, char **pzErr) {
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  sqlite3_declare_vtab(db, "CREATE TABLE x(value, pointer HIDDEN, count HIDDEN, ctype TEXT HIDDEN)");
+  tk_ca_vtab *v = sqlite3_malloc(sizeof(*v));
+  memset(v, 0, sizeof(*v));
+  *ppVtab = &v->base;
+  return SQLITE_OK;
+}
+
+static int tk_ca_disconnect (sqlite3_vtab *pVtab) {
+  sqlite3_free(pVtab);
+  return SQLITE_OK;
+}
+
+static int tk_ca_best_index (sqlite3_vtab *pVtab, sqlite3_index_info *p) {
+  (void)pVtab;
+  int ptr_idx = -1, cnt_idx = -1, type_idx = -1;
+  for (int i = 0; i < p->nConstraint; i++) {
+    if (!p->aConstraint[i].usable) continue;
+    if (p->aConstraint[i].op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+    switch (p->aConstraint[i].iColumn) {
+      case 1: ptr_idx = i; break;
+      case 2: cnt_idx = i; break;
+      case 3: type_idx = i; break;
+    }
+  }
+  if (ptr_idx >= 0) {
+    p->aConstraintUsage[ptr_idx].argvIndex = 1;
+    p->aConstraintUsage[ptr_idx].omit = 1;
+    int idx = 1;
+    if (cnt_idx >= 0) {
+      p->aConstraintUsage[cnt_idx].argvIndex = 2;
+      p->aConstraintUsage[cnt_idx].omit = 1;
+      idx |= 2;
+    }
+    if (type_idx >= 0) {
+      p->aConstraintUsage[type_idx].argvIndex = cnt_idx >= 0 ? 3 : 2;
+      p->aConstraintUsage[type_idx].omit = 1;
+      idx |= 4;
+    }
+    p->idxNum = idx;
+    p->estimatedCost = 1.0;
+  } else {
+    p->estimatedCost = 1e12;
+  }
+  return SQLITE_OK;
+}
+
+static int tk_ca_open (sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
+  (void)pVtab;
+  tk_ca_cur *c = sqlite3_malloc(sizeof(*c));
+  memset(c, 0, sizeof(*c));
+  *ppCur = &c->base;
+  return SQLITE_OK;
+}
+
+static int tk_ca_close (sqlite3_vtab_cursor *cur) {
+  sqlite3_free(cur);
+  return SQLITE_OK;
+}
+
+static int tk_ca_filter (sqlite3_vtab_cursor *cur, int idxNum,
+    const char *idxStr, int argc, sqlite3_value **argv) {
+  (void)idxStr;
+  tk_ca_cur *c = (tk_ca_cur *)cur;
+  c->row = 0;
+  c->ptr = NULL;
+  c->cnt = 0;
+  c->type = TK_CA_INT32;
+  if (idxNum & 1) {
+    tk_ca_bind *b = (tk_ca_bind *)sqlite3_value_pointer(argv[0], "carray");
+    if (b) {
+      c->ptr = b->ptr;
+      c->cnt = b->cnt;
+      c->type = b->type;
+    }
+    int ai = 1;
+    if ((idxNum & 2) && ai < argc) {
+      c->cnt = sqlite3_value_int(argv[ai]);
+      ai++;
+    }
+    if ((idxNum & 4) && ai < argc) {
+      const char *t = (const char *)sqlite3_value_text(argv[ai]);
+      if (t) {
+        if (strcmp(t, "int64") == 0) c->type = TK_CA_INT64;
+        else if (strcmp(t, "double") == 0) c->type = TK_CA_DOUBLE;
+        else if (strcmp(t, "float") == 0) c->type = TK_CA_FLOAT;
+        else c->type = TK_CA_INT32;
+      }
+    }
+  }
+  return SQLITE_OK;
+}
+
+static int tk_ca_next (sqlite3_vtab_cursor *cur) {
+  ((tk_ca_cur *)cur)->row++;
+  return SQLITE_OK;
+}
+
+static int tk_ca_eof (sqlite3_vtab_cursor *cur) {
+  tk_ca_cur *c = (tk_ca_cur *)cur;
+  return c->row >= c->cnt;
+}
+
+static int tk_ca_column (sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int i) {
+  tk_ca_cur *c = (tk_ca_cur *)cur;
+  if (i == 0 && c->ptr) {
+    switch (c->type) {
+      case TK_CA_INT32:
+        sqlite3_result_int(ctx, ((int32_t *)c->ptr)[c->row]); break;
+      case TK_CA_INT64:
+        sqlite3_result_int64(ctx, ((int64_t *)c->ptr)[c->row]); break;
+      case TK_CA_DOUBLE:
+        sqlite3_result_double(ctx, ((double *)c->ptr)[c->row]); break;
+      case TK_CA_FLOAT:
+        sqlite3_result_double(ctx, (double)((float *)c->ptr)[c->row]); break;
+    }
+  }
+  return SQLITE_OK;
+}
+
+static int tk_ca_rowid (sqlite3_vtab_cursor *cur, sqlite3_int64 *pRowid) {
+  *pRowid = ((tk_ca_cur *)cur)->row + 1;
+  return SQLITE_OK;
+}
+
+static sqlite3_module tk_carray_module = {
+  0, tk_ca_connect, tk_ca_connect, tk_ca_best_index,
+  tk_ca_disconnect, tk_ca_disconnect,
+  tk_ca_open, tk_ca_close, tk_ca_filter, tk_ca_next, tk_ca_eof,
+  tk_ca_column, tk_ca_rowid,
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+};
+
+static int detect_vec (lua_State *L, int idx, void **ptr, int *cnt, int *type) {
+  if (!lua_getmetatable(L, idx)) return 0;
+  struct { const char *name; int type; } vecs[] = {
+    {"tk_ivect", TK_CA_INT64}, {"tk_svect", TK_CA_INT32},
+    {"tk_fvect", TK_CA_FLOAT}, {"tk_dvect", TK_CA_DOUBLE},
+  };
+  for (int i = 0; i < 4; i++) {
+    luaL_getmetatable(L, vecs[i].name);
+    if (lua_rawequal(L, -1, -2)) {
+      lua_pop(L, 2);
+      struct { size_t n, m; void *a; } *v = lua_touserdata(L, idx);
+      *ptr = v->a;
+      *cnt = (int)v->n;
+      *type = vecs[i].type;
+      return 1;
+    }
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);
+  return 0;
+}
+
+static int stmt_bind_carray (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  int pidx = (int)luaL_checkinteger(L, 2);
+  void *data; int cnt, type;
+  if (!detect_vec(L, 3, &data, &cnt, &type))
+    return luaL_error(L, "bind_carray: expected ivec, svec, fvec, or dvec");
+  tk_ca_bind *b = malloc(sizeof(*b));
+  b->ptr = data;
+  b->cnt = cnt;
+  b->type = type;
+  sqlite3_bind_pointer(s->handle, pidx, b, "carray", tk_ca_bind_free);
+  lua_pushinteger(L, SQLITE_OK);
+  return 1;
+}
+
 static int stmt_columns (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
   lua_pushinteger(L, sqlite3_column_count(s->handle));
@@ -281,6 +470,7 @@ static luaL_Reg stmt_methods[] = {
   { "get_value", stmt_get_value },
   { "get_named_values", stmt_get_named_values },
   { "columns", stmt_columns },
+  { "bind_carray", stmt_bind_carray },
   { NULL, NULL }
 };
 
@@ -300,6 +490,7 @@ static void create_mt (lua_State *L, const char *name, luaL_Reg *methods, lua_CF
 }
 
 static int push_db (lua_State *L, sqlite3 *raw) {
+  sqlite3_create_module(raw, "carray", &tk_carray_module, NULL);
   tk_sqlite_db *db = (tk_sqlite_db *) lua_newuserdata(L, sizeof(tk_sqlite_db));
   db->handle = raw;
   db->stmts = NULL;
