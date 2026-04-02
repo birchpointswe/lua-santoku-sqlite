@@ -8,6 +8,11 @@ SQLITE_YEAR := 2025
 SQLITE_URL := https://www.sqlite.org/$(SQLITE_YEAR)/sqlite-amalgamation-$(SQLITE_VERSION).zip
 SQLITE_DIR := sqlite-amalgamation-$(SQLITE_VERSION)
 
+# Kept: json, subqueries, CTEs, cast, like/glob, collate, datetime, compound
+# select, FTS, pragmas, case expressions, returning, upsert, foreign keys.
+# Parser-referenced (can't omit): view, trigger, windowfunc, attach, detach,
+# vacuum, reindex, analyze, altertable.
+
 SQLITE_CFLAGS := \
   -Oz -flto -DNDEBUG \
   -DSQLITE_THREADSAFE=0 \
@@ -28,13 +33,17 @@ SQLITE_CFLAGS := \
   -DSQLITE_OMIT_INTEGRITY_CHECK \
   -DSQLITE_OMIT_SCHEMA_VERSION_PRAGMAS \
   -DSQLITE_OMIT_AUTOINCREMENT \
-  -DSQLITE_OMIT_CAST \
   -DSQLITE_OMIT_INCRBLOB \
+  -DSQLITE_OMIT_GENERATED_COLUMNS \
+  -DSQLITE_OMIT_BLOB_LITERAL \
+  -DSQLITE_OMIT_INTROSPECTION_PRAGMAS \
+  -DSQLITE_OMIT_LOOKASIDE \
   -DSQLITE_DQS=0 \
   -DSQLITE_DEFAULT_MEMSTATUS=0 \
   -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 \
   -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
-  -DSQLITE_ENABLE_JSON1
+  -DSQLITE_ENABLE_JSON1 \
+  -DSQLITE_MAX_EXPR_DEPTH=0
 
 results.mk:
 	if ! [ -f sqlite-amalgamation-$(SQLITE_VERSION).zip ]; then \
