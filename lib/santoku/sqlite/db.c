@@ -401,8 +401,8 @@ static sqlite3_module tk_carray_module = {
 static int detect_vec (lua_State *L, int idx, void **ptr, int *cnt, int *type) {
   if (!lua_getmetatable(L, idx)) return 0;
   struct { const char *name; int type; } vecs[] = {
-    {"tk_ivect", TK_CA_INT64}, {"tk_svect", TK_CA_INT32},
-    {"tk_fvect", TK_CA_FLOAT}, {"tk_dvect", TK_CA_DOUBLE},
+    {"tk_ivec_t", TK_CA_INT64}, {"tk_svec_t", TK_CA_INT32},
+    {"tk_fvec_t", TK_CA_FLOAT}, {"tk_dvec_t", TK_CA_DOUBLE},
   };
   for (int i = 0; i < 4; i++) {
     luaL_getmetatable(L, vecs[i].name);
