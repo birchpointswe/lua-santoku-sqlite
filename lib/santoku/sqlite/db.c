@@ -68,8 +68,7 @@ static int db_prepare (lua_State *L) {
   sqlite3_stmt *raw = NULL;
   int rc = sqlite3_prepare_v2(db->handle, sql, (int) len, &raw, NULL);
   if (rc != SQLITE_OK || !raw) {
-    lua_pushnil(L);
-    return 1;
+    return luaL_error(L, "prepare: %s", sqlite3_errmsg(db->handle));
   }
   tk_sqlite_stmt *s = (tk_sqlite_stmt *) lua_newuserdata(L, sizeof(tk_sqlite_stmt));
   memset(s, 0, sizeof(tk_sqlite_stmt));
