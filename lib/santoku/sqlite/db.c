@@ -153,6 +153,10 @@ static int stmt_reset (lua_State *L) {
   return 1;
 }
 
+static int detect_vec (lua_State *L, int idx, void **ptr, int *cnt, int *type);
+typedef struct { void *ptr; int cnt; int type; } tk_ca_bind;
+static void tk_ca_bind_free (void *p);
+
 static void bind_one (lua_State *L, sqlite3_stmt *h, int pidx, int vidx) {
   switch (lua_type(L, vidx)) {
     case LUA_TNIL:
@@ -168,6 +172,19 @@ static void bind_one (lua_State *L, sqlite3_stmt *h, int pidx, int vidx) {
       size_t len;
       const char *str = lua_tolstring(L, vidx, &len);
       sqlite3_bind_text(h, pidx, str, (int) len, SQLITE_TRANSIENT);
+      break;
+    }
+    case LUA_TUSERDATA: {
+      void *ptr; int cnt, type;
+      if (detect_vec(L, vidx, &ptr, &cnt, &type)) {
+        tk_ca_bind *b = malloc(sizeof(*b));
+        b->ptr = ptr;
+        b->cnt = cnt;
+        b->type = type;
+        sqlite3_bind_pointer(h, pidx, b, "carray", tk_ca_bind_free);
+      } else {
+        sqlite3_bind_null(h, pidx);
+      }
       break;
     }
     default:
@@ -249,8 +266,6 @@ static int stmt_get_named_values (lua_State *L) {
 #define TK_CA_INT64  1
 #define TK_CA_DOUBLE 2
 #define TK_CA_FLOAT  3
-
-typedef struct { void *ptr; int cnt; int type; } tk_ca_bind;
 
 static void tk_ca_bind_free (void *p) { free(p); }
 
