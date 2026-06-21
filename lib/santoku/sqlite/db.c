@@ -440,9 +440,21 @@ static int stmt_bind_carray (lua_State *L) {
   void *data; int cnt, type;
   if (!detect_vec(L, 3, &data, &cnt, &type))
     return luaL_error(L, "bind_carray: expected ivec, svec, fvec, or dvec");
+  int start = (int) luaL_optinteger(L, 4, 0);
+  int count = (int) luaL_optinteger(L, 5, cnt - start);
+  if (start < 0 || count < 0 || start + count > cnt)
+    return luaL_error(L, "bind_carray: slice [%d,%d) out of range for length %d",
+      start, start + count, cnt);
+  size_t esz;
+  switch (type) {
+    case TK_CA_INT64:  esz = sizeof(int64_t); break;
+    case TK_CA_DOUBLE: esz = sizeof(double); break;
+    case TK_CA_FLOAT:  esz = sizeof(float); break;
+    default:           esz = sizeof(int32_t); break;
+  }
   tk_ca_bind *b = malloc(sizeof(*b));
-  b->ptr = data;
-  b->cnt = cnt;
+  b->ptr = (char *) data + (size_t) start * esz;
+  b->cnt = count;
   b->type = type;
   sqlite3_bind_pointer(s->handle, pidx, b, "carray", tk_ca_bind_free);
   lua_pushinteger(L, SQLITE_OK);
