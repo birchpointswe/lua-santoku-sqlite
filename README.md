@@ -1,47 +1,162 @@
-# Santoku SQLite
+# santoku-sqlite
 
-SQLite database wrapper for Lua with transaction management and prepared statement caching.
+A SQLite binding for Lua: a small C core (`santoku.sqlite.db`) over the SQLite C API,
+a Lua wrapper (`santoku.sqlite`) that turns prepared statements into reusable query
+closures with transaction control, and two extras built on top: a carray virtual table
+that binds santoku-matrix vectors as zero-copy SQL inputs, and a TF/cosine document
+search index (`santoku.sqlite.search`).
 
-## Module Reference
+This README is a usage guide, not an API reference. **The tests are the spec**: each
+section names the test that exercises its full surface. Read those for the exhaustive
+behaviour; read this (and [`doc/usage.md`](doc/usage.md)) for the shape and conventions.
 
-### `santoku.sqlite`
+Vector and CSR types (`ivec`/`svec`/`fvec`/`dvec`/`csr`) are **santoku-matrix** types;
+this doc uses them for the carray and search paths but does not re-explain them, see the
+[matrix README](../lua-santoku-matrix/README.md). Errors, `assert`, and `pcall` come from
+base **santoku** (`santoku.error`), see the [santoku README](../lua-santoku/README.md).
 
-| Function | Arguments | Returns | Description |
-|----------|-----------|---------|-------------|
-| `sqlite` | `path` | `db` | Opens SQLite database at path |
+## Layers
 
-### Database Object
+- `santoku.sqlite.db` (C): the raw binding. `open`/`open_memory`/`open_v2` return a
+  connection userdata; `:prepare`, `:exec`, `:step`, `:bind_*`, `:get_*` map onto the
+  SQLite C calls. You can use this directly (see the carray test), but most code goes
+  through the wrapper.
+- `santoku.sqlite` (Lua): `local sql = require("santoku.sqlite")`. Call `sql(conn)` to
+  wrap a connection; you get `exec`, the query-closure factories (`runner`/`getter`/
+  `iter`/`all`/`inserter`), and transaction control (`transaction`/`begin`/`commit`/
+  `rollback`/`close`). This is the front door.
+- `santoku.sqlite.search` (Lua): a per-token inverted index over a wrapped connection,
+  fed and queried with `csr` rows. Optional weighting (cosine over TF) and partitioning.
+- carray: not a module. It is a SQLite virtual table the C core registers on every
+  connection. Pass a vec where a statement parameter is expected and it becomes a
+  zero-copy table-valued input: `select value from carray(?)`.
 
-| Function | Arguments | Returns | Description |
-|----------|-----------|---------|-------------|
-| `db.exec` | `sql` | `-` | Executes SQL statement without results |
-| `db.transaction` | `[tag,] fn, ...` | `...` | Runs function in transaction, auto-commits on success, rolls back on error |
-| `db.begin` | `[type]` | `-` | Starts transaction (type: `"deferred"`, `"immediate"`, `"exclusive"`) |
-| `db.commit` | `-` | `-` | Commits current transaction |
-| `db.rollback` | `-` | `-` | Rolls back current transaction |
-| `db.close` | `-` | `-` | Closes database connection |
+## Conventions
 
-### Query Functions
+- **Wrap once.** `sql(conn)` returns a table of closures bound to that connection. The
+  raw connection stays reachable as `db.db` for the few things the wrapper does not cover
+  (used by `search` and the carray test).
+- **Statements are cached in the closure.** Each factory call (`db.runner(sql)`,
+  `db.getter(sql)`, ...) prepares once and returns a closure that resets and re-binds on
+  every call. Reuse the closure; do not re-create it per row.
+- **Errors raise.** The wrapper checks return codes and raises through `santoku.error`
+  (message plus SQLite errcode), so wrap calls in `pcall` if you want to recover. The C
+  layer returns raw integer codes (`OK`/`ROW`/`DONE`); the wrapper interprets them.
+- **`prop` selects the row shape.** `nil`/omitted gives the first column value; `true`
+  gives a `{ column = value }` table; `false` discards results (for statements run only
+  for their side effects).
+- **Binding is positional or named.** Pass values for `?1`/`?` positionally, or pass a
+  single table for `:name` parameters. Numbers, strings (with embedded zeros), booleans,
+  and `nil` (SQL null) all bind; a vec userdata binds as a carray.
 
-| Function | Arguments | Returns | Description |
-|----------|-----------|---------|-------------|
-| `db.iter` | `sql, [prop]` | `fn, reset` | Returns iterator function and reset function for query |
-| `db.all` | `sql, [prop]` | `fn` | Returns function that executes query and returns all results |
-| `db.runner` | `sql` | `fn` | Returns function that executes statement without returning results |
-| `db.getter` | `sql, [prop]` | `fn` | Returns function that executes query and returns first row |
-| `db.inserter` | `sql` | `fn` | Returns function that executes insert and returns last insert rowid |
+## The core path: open, exec, query
 
-### Parameter Binding
+```lua
+local sqlite = require("santoku.sqlite.db")
+local sql    = require("santoku.sqlite")
 
-Functions returned by query methods accept parameters:
-- Positional: `fn(val1, val2, ...)`
-- Named: `fn({ name1 = val1, name2 = val2 })`
+local db = sql(sqlite.open_memory())          -- or sqlite.open(path) / sqlite.open_v2(path, vfs)
 
-### Result Format (`prop` parameter)
+db.exec([[ create table cities (name text, state text) ]])
 
-- `nil` or omitted: Returns first column value
-- `true`: Returns table with column names as keys
-- `false`: Returns nothing (for statements without results)
+local addcity = db.runner("insert into cities (name, state) values (?, ?)")
+addcity("Tampa", "Florida")
+addcity("Albany", "New York")
+
+local getcity = db.getter("select * from cities where name = ?", true)   -- prop=true -> row table
+getcity("Tampa")                              -- { name = "Tampa", state = "Florida" }
+
+local getstate = db.getter("select state from cities where name = ?")    -- prop nil -> first column
+getstate("Albany")                            -- "New York"
+
+for row in db.iter("select * from cities", true)() do                    -- streaming iterator
+  -- row.name, row.state
+end
+
+local all = db.all("select * from cities", true)()                       -- list of row tables
+
+db.close()
+```
+
+Anchor test: `test/spec/santoku/sqlite.lua`.
+
+## Query-closure factories
+
+All factories prepare the SQL once and return a closure. The closure binds its arguments
+(positional or a single named table), runs the statement, and resets it.
+
+| Factory | Closure returns | Use |
+|---------|-----------------|-----|
+| `db.runner(sql)` | `-` | DDL and writes run for side effects only |
+| `db.getter(sql[, prop])` | first row (shape by `prop`) | single-row reads |
+| `db.iter(sql[, prop])` | a stepping iterator function | streaming `for` loops |
+| `db.all(sql[, prop])` | a list of all rows | small result sets in memory |
+| `db.inserter(sql)` | `last_insert_rowid()` | inserts that need the new rowid |
+
+`db.exec(sql)` runs SQL directly with no prepared statement or binding (multi-statement
+DDL scripts). See `doc/usage.md` for the per-factory examples and the `prop` matrix.
+
+## Transactions
+
+`db.transaction(fn, ...)` runs `fn` inside `begin immediate` / `commit`, rolling back and
+re-raising if `fn` errors. A leading string selects the mode: `db.transaction("deferred",
+fn, ...)`. Nested calls reuse the outer transaction (the inner call just runs `fn`), so
+helpers that each open a transaction compose without error. Every factory closure already
+wraps its body in `transaction`, so prepared statements are created inside one.
+
+`db.begin([mode])`, `db.commit()`, `db.rollback()` are the manual primitives if you need
+explicit control. Anchor: the transaction and nested-transaction cases in
+`test/spec/santoku/sqlite.lua`.
+
+## carray: bind a vector as a table-valued input
+
+The C core registers a `carray` virtual table on every connection. Anywhere a parameter
+is expected, pass a santoku-matrix vec and it is exposed as rows of a single `value`
+column, read directly from the vec's backing store (no copy). Element type follows the
+vec: `ivec` to int64, `svec` to int32, `fvec` to float, `dvec` to double.
+
+```lua
+local ivec = require("santoku.ivec")
+local q = db.all("select value from carray(?) order by rowid", true)
+q(ivec.create({ 10, 20, 30 }))                -- { {value=10}, {value=20}, {value=30} }
+```
+
+For partial binds use the raw statement method `stmt:bind_carray(pidx, vec[, start, count])`,
+which binds a `[start, start+count)` slice and raises on an out-of-range slice. Anchor
+test: `test/spec/santoku/sqlite/carray.lua`.
+
+## search: TF / cosine document index
+
+`santoku.sqlite.search` builds an inverted index in two tables (`<name>_tf`, `<name>_doc`)
+on a wrapped connection. Documents and queries are `csr` rows: column ids are token ids,
+values are term weights. Tokens and weights cross into SQL through carray, so indexing a
+batch is one statement per document, not one per token.
+
+```lua
+local search = require("santoku.sqlite.search")
+local csr    = require("santoku.csr")
+
+local idx = search.create(db, { name = "docs" })     -- weighted (cosine) by default
+idx.add({ "a", "b", "c" }, csr_of_three_rows)        -- ids list + one csr row per id
+local hits = idx.search(query_csr, 10)               -- { { id = ..., score = ... }, ... }
+idx.remove({ "a" })
+idx.clear()
+```
+
+`search.create(db, opts)` options: `name` (table prefix, must be a valid identifier),
+`weighted` (default `true`; `false` ranks by match count and needs no values),
+`partition` (default `false`; when `true`, every call takes a leading partition string and
+namespaces are isolated). The returned table has `add`, `remove`, `clear`, `search`. With
+`partition = true` the signatures gain a leading partition: `idx.add(part, ids, csr)`,
+`idx.search(part, csr, limit)`, `idx.clear(part)`. Anchor test:
+`test/spec/santoku/sqlite/search.lua`.
+
+## Building / testing
+
+This repo uses the `toku` build harness. The C core links a bundled SQLite amalgamation
+(see `make.lua`). Tests live in `test/spec/santoku/`; run them through `toku` so the
+native module is compiled and on the path. Runtime dependency: base `santoku`. The tests
+additionally depend on `santoku-matrix` for the vec/csr types used by carray and search.
 
 ## License
 

@@ -26,14 +26,25 @@ local function create (db, opts)
   assert(type(opts) == "table", "search.create: opts table required")
   local name = opts.name
   assert(valid_name(name), "search.create: opts.name must be a valid identifier")
-  local partition = opts.partition and true or false
+  local pname
+  if opts.partition == true then
+    pname = "part"
+  elseif type(opts.partition) == "string" then
+    pname = opts.partition
+  end
+  if pname ~= nil then
+    assert(valid_name(pname), "search.create: partition column must be a valid identifier")
+    assert(pname ~= "id" and pname ~= "token" and pname ~= "tf" and pname ~= "norm",
+      "search.create: partition column name conflicts with a reserved column")
+  end
+  local partition = pname ~= nil
   local weighted = opts.weighted
   if weighted == nil then weighted = true end
   local rawdb = db.db
 
-  local pcol = partition and "part text not null, " or ""
-  local ppk = partition and "part, " or ""
-  local idcols = partition and "part, id, " or "id, "
+  local pcol = partition and (pname .. " text not null, ") or ""
+  local ppk = partition and (pname .. ", ") or ""
+  local idcols = partition and (pname .. ", id, ") or "id, "
   local idsel = partition and "?1, ?2" or "?1"
   local tok_p = partition and 3 or 2
 
@@ -49,56 +60,70 @@ local function create (db, opts)
   end
   db.exec(ddl)
 
-  local insert_tf
+  local insert_tf, insert_tf_counted, insert_doc, insert_doc_counted
   if weighted then
     insert_tf = rawdb:prepare(
       "insert into " .. name .. "_tf (" .. idcols .. "token, tf) " ..
       "select " .. idsel .. ", t.value, w.value " ..
       "from carray(?" .. tok_p .. ") t join carray(?" .. (tok_p + 1) .. ") w on t.rowid = w.rowid")
+    insert_tf_counted = rawdb:prepare(
+      "insert into " .. name .. "_tf (" .. idcols .. "token, tf) " ..
+      "select " .. idsel .. ", t.value, count(*) " ..
+      "from carray(?" .. tok_p .. ") t group by t.value")
+    insert_doc = rawdb:prepare(
+      "insert into " .. name .. "_doc (" .. idcols .. "norm) " ..
+      "select " .. idsel .. ", sqrt(sum(w.value * w.value)) from carray(?" .. tok_p .. ") w")
+    insert_doc_counted = rawdb:prepare(
+      "insert into " .. name .. "_doc (" .. idcols .. "norm) " ..
+      "select " .. idsel .. ", sqrt(sum(c * c)) " ..
+      "from (select count(*) c from carray(?" .. tok_p .. ") t group by t.value)")
   else
     insert_tf = rawdb:prepare(
       "insert into " .. name .. "_tf (" .. idcols .. "token) " ..
       "select " .. idsel .. ", t.value from carray(?" .. tok_p .. ") t")
   end
 
-  local insert_doc
-  if weighted then
-    insert_doc = rawdb:prepare(
-      "insert into " .. name .. "_doc (" .. idcols .. "norm) " ..
-      "select " .. idsel .. ", sqrt(sum(w.value * w.value)) from carray(?" .. tok_p .. ") w")
-  end
-
   local s_limit_p = partition and 2 or 1
   local s_qtok_p = partition and 3 or 2
   local s_qval_p = s_qtok_p + 1
-  local search_sql
+  local docjoin = "join " .. name .. "_doc d on " ..
+    (partition and ("d." .. pname .. " = s." .. pname .. " and ") or "") .. "d.id = s.id "
+  local pwhere = partition and ("where s." .. pname .. " = ?1 ") or ""
+  local search_stmt, search_stmt_counted
   if weighted then
-    search_sql =
+    search_stmt = rawdb:prepare(
       "select s.id as id, sum(s.tf * q.tf) / " ..
       "(d.norm * (select sqrt(sum(value * value)) from carray(?" .. s_qval_p .. "))) as score " ..
       "from " .. name .. "_tf s " ..
       "join (select t.value as token, w.value as tf from carray(?" .. s_qtok_p .. ") t " ..
       "join carray(?" .. s_qval_p .. ") w on t.rowid = w.rowid) q on s.token = q.token " ..
-      "join " .. name .. "_doc d on " .. (partition and "d.part = s.part and " or "") .. "d.id = s.id " ..
-      (partition and "where s.part = ?1 " or "") ..
-      "group by s.id order by score desc limit ?" .. s_limit_p
+      docjoin .. pwhere ..
+      "group by s.id order by score desc limit ?" .. s_limit_p)
+    search_stmt_counted = rawdb:prepare(
+      "select s.id as id, sum(s.tf * q.tf) / " ..
+      "(d.norm * (select sqrt(sum(c * c)) from " ..
+      "(select count(*) c from carray(?" .. s_qtok_p .. ") t group by t.value))) as score " ..
+      "from " .. name .. "_tf s " ..
+      "join (select t.value as token, count(*) as tf from carray(?" .. s_qtok_p .. ") t " ..
+      "group by t.value) q on s.token = q.token " ..
+      docjoin .. pwhere ..
+      "group by s.id order by score desc limit ?" .. s_limit_p)
   else
-    search_sql =
+    search_stmt = rawdb:prepare(
       "select s.id as id, count(*) as score " ..
       "from " .. name .. "_tf s " ..
       "join (select value as token from carray(?" .. s_qtok_p .. ")) q on s.token = q.token " ..
-      (partition and "where s.part = ?1 " or "") ..
-      "group by s.id order by score desc limit ?" .. s_limit_p
+      pwhere ..
+      "group by s.id order by score desc limit ?" .. s_limit_p)
   end
-  local search_stmt = rawdb:prepare(search_sql)
 
   local del_tf, del_doc, clear_tf, clear_doc
   if partition then
-    del_tf = db.runner("delete from " .. name .. "_tf where part = ?1 and id = ?2")
-    clear_tf = db.runner("delete from " .. name .. "_tf where part = ?1")
+    del_tf = db.runner("delete from " .. name .. "_tf where " .. pname .. " = ?1 and id = ?2")
+    clear_tf = db.runner("delete from " .. name .. "_tf where " .. pname .. " = ?1")
     if weighted then
-      del_doc = db.runner("delete from " .. name .. "_doc where part = ?1 and id = ?2")
-      clear_doc = db.runner("delete from " .. name .. "_doc where part = ?1")
+      del_doc = db.runner("delete from " .. name .. "_doc where " .. pname .. " = ?1 and id = ?2")
+      clear_doc = db.runner("delete from " .. name .. "_doc where " .. pname .. " = ?1")
     end
   else
     del_tf = db.runner("delete from " .. name .. "_tf where id = ?1")
@@ -116,6 +141,10 @@ local function create (db, opts)
     end
   end
 
+  local function bind_id (stmt, part, id)
+    if partition then stmt:bind_values(part, id) else stmt:bind_values(id) end
+  end
+
   local function add (...)
     local part, ids, csr
     if partition then part, ids, csr = ... else ids, csr = ... end
@@ -123,9 +152,6 @@ local function create (db, opts)
     local offs = csr:offsets()
     local toks = csr:neighbors()
     local vals = weighted and csr:values() or nil
-    if weighted and not vals then
-      return error("search.add: weighted index requires a CSR with values")
-    end
     local ndocs = offs:size() - 1
     if #ids ~= ndocs then
       return error("search.add: ids length (" .. #ids ..
@@ -139,16 +165,30 @@ local function create (db, opts)
       end
       local id = ids[i + 1]
       del_one(part, id)
-      insert_tf:reset()
-      if partition then insert_tf:bind_values(part, id) else insert_tf:bind_values(id) end
-      insert_tf:bind_carray(tok_p, toks, lo, len)
-      if weighted then insert_tf:bind_carray(tok_p + 1, vals, lo, len) end
-      drive(rawdb, insert_tf)
-      if weighted then
+      if not weighted then
+        insert_tf:reset()
+        bind_id(insert_tf, part, id)
+        insert_tf:bind_carray(tok_p, toks, lo, len)
+        drive(rawdb, insert_tf)
+      elseif vals then
+        insert_tf:reset()
+        bind_id(insert_tf, part, id)
+        insert_tf:bind_carray(tok_p, toks, lo, len)
+        insert_tf:bind_carray(tok_p + 1, vals, lo, len)
+        drive(rawdb, insert_tf)
         insert_doc:reset()
-        if partition then insert_doc:bind_values(part, id) else insert_doc:bind_values(id) end
+        bind_id(insert_doc, part, id)
         insert_doc:bind_carray(tok_p, vals, lo, len)
         drive(rawdb, insert_doc)
+      else
+        insert_tf_counted:reset()
+        bind_id(insert_tf_counted, part, id)
+        insert_tf_counted:bind_carray(tok_p, toks, lo, len)
+        drive(rawdb, insert_tf_counted)
+        insert_doc_counted:reset()
+        bind_id(insert_doc_counted, part, id)
+        insert_doc_counted:bind_carray(tok_p, toks, lo, len)
+        drive(rawdb, insert_doc_counted)
       end
     end
   end
@@ -179,27 +219,25 @@ local function create (db, opts)
     local offs = csr:offsets()
     local toks = csr:neighbors()
     local vals = weighted and csr:values() or nil
-    if weighted and not vals then
-      return error("search.search: weighted index requires a CSR with values")
-    end
     local lo = offs:get(0)
     local len = offs:get(1) - lo
     if len <= 0 then return {} end
-    search_stmt:reset()
-    if partition then search_stmt:bind_values(part, limit) else search_stmt:bind_values(limit) end
-    search_stmt:bind_carray(s_qtok_p, toks, lo, len)
-    if weighted then search_stmt:bind_carray(s_qval_p, vals, lo, len) end
+    local stmt = (weighted and not vals) and search_stmt_counted or search_stmt
+    stmt:reset()
+    if partition then stmt:bind_values(part, limit) else stmt:bind_values(limit) end
+    stmt:bind_carray(s_qtok_p, toks, lo, len)
+    if weighted and vals then stmt:bind_carray(s_qval_p, vals, lo, len) end
     local out = {}
     while true do
-      local res = search_stmt:step()
+      local res = stmt:step()
       if res == ROW then
-        out[#out + 1] = search_stmt:get_named_values()
+        out[#out + 1] = stmt:get_named_values()
       elseif res == DONE then
-        search_stmt:reset()
+        stmt:reset()
         break
       else
         local msg, code = rawdb:errmsg(), rawdb:errcode()
-        search_stmt:reset()
+        stmt:reset()
         return error(msg, code)
       end
     end

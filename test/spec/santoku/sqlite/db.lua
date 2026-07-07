@@ -3,6 +3,7 @@ local serialize = require("santoku.serialize") -- luacheck: ignore
 
 local err = require("santoku.error")
 local assert = err.assert
+local pcall = err.pcall
 
 local tbl = require("santoku.table")
 local teq = tbl.equals
@@ -154,4 +155,62 @@ test("nested transaction", function ()
 
     end)
   end)
+end)
+
+test("binds named parameters", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table cities (name text, state text)")
+  local add = db.runner("insert into cities (name, state) values (:name, :state)")
+  add({ name = "Tampa", state = "Florida" })
+  local get = db.getter("select state from cities where name = :name")
+  assert(eq(get({ name = "Tampa" }), "Florida"))
+end)
+
+test("round-trips null and text with embedded zeros", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (a, b)")
+  db.runner("insert into t (a, b) values (?, ?)")(nil, "x\0y")
+  local row = db.getter("select a, b from t", true)()
+  assert(eq(row.a, nil))
+  assert(eq(row.b, "x\0y"))
+end)
+
+test("propagates sql errors", function ()
+  local db = sql(sqlite.open_memory())
+  assert(eq(pcall(function () db.exec("not valid sql") end), false))
+  assert(eq(pcall(function () db.runner("select x from nope") end), false))
+end)
+
+test("persists to a file across open and close", function ()
+  local dir = os.getenv("PREFIX")
+  local path = (dir and (dir .. "/tmp") or "/tmp") ..
+    "/tk_sqlite_test_" .. tostring(os.time()) .. "_" .. tostring(math.random(1, 1000000)) .. ".db"
+  os.remove(path)
+  local d1 = sql(sqlite.open(path))
+  d1.exec("create table t (n)")
+  d1.runner("insert into t (n) values (?)")(42)
+  d1.close()
+  local d2 = sql(sqlite.open(path))
+  assert(eq(d2.getter("select n from t")(), 42))
+  d2.close()
+  os.remove(path)
+end)
+
+test("manual begin/commit and begin/rollback", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (n integer)")
+  local addn = db.runner("insert into t (n) values (?)")
+  local count = db.getter("select count(*) from t")
+
+  db.begin("immediate")
+  addn(1)
+  addn(2)
+  db.commit()
+  assert(eq(count(), 2))
+
+  db.begin()
+  addn(3)
+  db.rollback()
+  assert(eq(count(), 2))
+  db.close()
 end)

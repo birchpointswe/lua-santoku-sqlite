@@ -139,7 +139,28 @@ test("partition: namespaces are isolated", function ()
 
 end)
 
-test("errors: empty row and missing values", function ()
+test("partition: custom column name", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = search.create(db, { name = "cn", partition = "sub" })
+
+  idx.add("u1", { "doc1" }, mkcsr({ 0, 2 }, { 1, 2 }, { 1, 1 }))
+  idx.add("u2", { "doc2" }, mkcsr({ 0, 2 }, { 1, 2 }, { 1, 1 }))
+
+
+  assert(eq(db.getter("select sub from cn_tf where id = 'doc1'")(), "u1"))
+
+  local r1 = idx.search("u1", mkcsr({ 0, 2 }, { 1, 2 }, { 1, 1 }), 10)
+  assert(eq(#r1, 1))
+  assert(eq(r1[1].id, "doc1"))
+
+  idx.remove("u2", { "doc2" })
+  assert(eq(#idx.search("u2", mkcsr({ 0, 2 }, { 1, 2 }, { 1, 1 }), 10), 0))
+  assert(eq(#idx.search("u1", mkcsr({ 0, 2 }, { 1, 2 }, { 1, 1 }), 10), 1))
+
+end)
+
+test("errors: empty row", function ()
 
   local db = sql(sqlite.open_memory())
   local idx = search.create(db, { name = "e" })
@@ -148,9 +169,45 @@ test("errors: empty row and missing values", function ()
   local ok = pcall(idx.add, { "a", "b" }, mkcsr({ 0, 0, 2 }, { 1, 2 }, { 1, 1 }))
   assert(eq(ok, false))
 
+end)
 
-  ok = pcall(idx.add, { "z" }, mkcsr({ 0, 2 }, { 1, 2 }))
-  assert(eq(ok, false))
+test("counted: derives tf from occurrence counts when no weights", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = search.create(db, { name = "cnt" })
+
+
+
+
+  idx.add({ "a", "b" }, mkcsr({ 0, 3, 6 }, { 1, 1, 2, 1, 2, 2 }))
+
+
+  assert(eq(db.getter("select tf from cnt_tf where id = 'a' and token = 1")(), 2))
+  assert(eq(db.getter("select tf from cnt_tf where id = 'b' and token = 2")(), 2))
+
+
+  local res = idx.search(mkcsr({ 0, 2 }, { 1, 1 }), 10)
+  assert(eq(#res, 2))
+  assert(eq(res[1].id, "a"))
+
+  assert(math.abs(res[1].score - (4 / (2 * math.sqrt(5)))) < 1e-6)
+
+  assert(math.abs(res[2].score - (2 / (2 * math.sqrt(5)))) < 1e-6)
+
+end)
+
+test("counted: a valued query against a counted index still works", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = search.create(db, { name = "mix" })
+
+
+  idx.add({ "a", "b" }, mkcsr({ 0, 2, 4 }, { 1, 1, 1, 2 }))
+
+
+  local res = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10)
+  assert(eq(#res, 2))
+  assert(eq(res[1].id, "a"))
 
 end)
 
