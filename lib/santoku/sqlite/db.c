@@ -615,6 +615,21 @@ EM_JS(void, tk_sah_setup, (), {
     }
     pool.capacity = pool.files.length;
   };
+  globalThis.__tk_sah_file_size = function (path) {
+    var pool = Module._sahPool;
+    if (!pool || !(path in pool.pathMap)) return -1;
+    var sah = pool.files[pool.pathMap[path]].sah;
+    var total = sah.getSize();
+    return total > 4096 ? total - 4096 : 0;
+  };
+  globalThis.__tk_sah_read_chunk = function (path, off, len) {
+    var pool = Module._sahPool;
+    if (!pool || !(path in pool.pathMap)) return null;
+    var sah = pool.files[pool.pathMap[path]].sah;
+    var buf = new Uint8Array(len);
+    var got = sah.read(buf, { at: 4096 + off });
+    return got < len ? buf.subarray(0, got) : buf;
+  };
 });
 
 EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
