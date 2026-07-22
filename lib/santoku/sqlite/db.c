@@ -568,64 +568,188 @@ static int tk_open_v2 (lua_State *L) {
 #ifdef __EMSCRIPTEN__
 
 #define SAH_PATH_MAX 512
-#define SAH_VFS_NAME "opfs-sahpool"
+#define SAH_VFS_NAME "opfs-coop"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 EM_JS(void, tk_sah_setup, (), {
-  if (Module._sahPool) return;
-  Module._sahPool = {
+  if (Module._coop) return;
+  var C = Module._coop = {
     files: [],
     pathMap: {},
     capacity: 0,
     dirHandle: null,
     opaqueHandle: null,
+    held: false,
+    want: false,
+    releaseLock: null,
+    acquiring: null,
+    bc: null,
+    lockName: null,
   };
-  globalThis.__tk_sah_pool_init = async function (dir, capacity) {
-    var pool = Module._sahPool;
+
+  async function openAll (retries) {
+    for (var i = 0; i < C.files.length; i++) {
+      var slot = C.files[i];
+      if (slot.sah) continue;
+      for (var attempt = 0; ; attempt++) {
+        try {
+          slot.sah = await slot.fh.createSyncAccessHandle();
+          break;
+        } catch (e) {
+
+
+          if (attempt >= retries) throw e;
+          await new Promise(function (r) { setTimeout(r, 250); });
+        }
+      }
+    }
+  }
+
+  function closeAll () {
+    for (var i = 0; i < C.files.length; i++) {
+      var slot = C.files[i];
+      if (slot.sah) {
+        try { slot.sah.flush(); } catch (e) {}
+        try { slot.sah.close(); } catch (e) {}
+        slot.sah = null;
+      }
+    }
+  }
+
+  function rescan () {
+    C.pathMap = {};
+    for (var i = 0; i < C.files.length; i++) {
+      var slot = C.files[i];
+      var hdr = new Uint8Array(516);
+      var got = slot.sah.read(hdr, { at: 0 });
+      var path = "";
+      if (got >= 516) {
+        for (var j = 0; j < 512; j++) {
+          if (hdr[j] === 0) break;
+          path += String.fromCharCode(hdr[j]);
+        }
+      }
+      slot.path = path;
+      slot.flags = got >= 516
+        ? (hdr[512] | (hdr[513] << 8) | (hdr[514] << 16) | (hdr[515] << 24))
+        : 0;
+      if (path.length > 0) C.pathMap[path] = i;
+    }
+  }
+
+  globalThis.__tk_coop_init = async function (dir, capacity) {
     var root = await navigator.storage.getDirectory();
-    pool.dirHandle = await root.getDirectoryHandle(dir, { create: true });
-    pool.opaqueHandle = await pool.dirHandle.getDirectoryHandle(".opaque", { create: true });
+    C.dirHandle = await root.getDirectoryHandle(dir, { create: true });
+    C.opaqueHandle = await C.dirHandle.getDirectoryHandle(".opaque", { create: true });
+    C.lockName = "tk-coop:" + dir;
+    C.bc = new BroadcastChannel(C.lockName);
+    C.bc.onmessage = function (ev) {
+      if (ev && ev.data === "want") {
+        C.want = true;
+        globalThis.__tk_coop_maybe_release();
+      }
+    };
     var existing = [];
-    for await (var entry of pool.opaqueHandle.values()) {
+    for await (var entry of C.opaqueHandle.values()) {
       if (entry.kind === "file") existing.push(entry.name);
     }
     existing.sort();
-    for (var i = 0; i < existing.length; i++) {
-      var fh = await pool.opaqueHandle.getFileHandle(existing[i]);
-      var sah = await fh.createSyncAccessHandle();
-      var hdr = new Uint8Array(4096);
-      sah.read(hdr, { at: 0 });
-      var path = "";
-      for (var j = 0; j < 512; j++) {
-        if (hdr[j] === 0) break;
-        path += String.fromCharCode(hdr[j]);
-      }
-      var flags = hdr[512] | (hdr[513] << 8) |
-                  (hdr[514] << 16) | (hdr[515] << 24);
-      var slot = { sah: sah, path: path, flags: flags, fid: i };
-      pool.files.push(slot);
-      if (path.length > 0)
-        pool.pathMap[path] = i;
+    var names = existing.slice();
+    for (var k = names.length; k < capacity; k++)
+      names.push(String(k).padStart(8, "0"));
+    for (var i = 0; i < names.length; i++) {
+      var fh = await C.opaqueHandle.getFileHandle(names[i], { create: true });
+      C.files.push({ name: names[i], fh: fh, sah: null, path: "", flags: 0 });
     }
-    for (var k = pool.files.length; k < capacity; k++) {
-      var name = String(k).padStart(8, "0");
-      var fh = await pool.opaqueHandle.getFileHandle(name, { create: true });
-      var sah = await fh.createSyncAccessHandle();
-      var slot = { sah: sah, path: "", flags: 0, fid: k };
-      pool.files.push(slot);
-    }
-    pool.capacity = pool.files.length;
+    C.capacity = C.files.length;
   };
+
+  globalThis.__tk_coop_acquire = function () {
+    if (C.held) return Promise.resolve();
+    if (C.acquiring) return C.acquiring;
+    C.acquiring = new Promise(function (resolve, reject) {
+      try { C.bc.postMessage("want"); } catch (e) {}
+      var stole = false;
+      function grab (opts) {
+        return navigator.locks.request(C.lockName, opts, function () {
+
+
+
+
+          return openAll(80).then(function () {
+            rescan();
+            C.held = true;
+            C.want = false;
+            C.acquiring = null;
+            resolve();
+            return new Promise(function (release) { C.releaseLock = release; });
+          });
+        });
+      }
+      var timer = setTimeout(function () {
+
+
+
+        if (C.held || C.acquiring === null || stole) return;
+        stole = true;
+        grab({ mode: "exclusive", steal: true }).catch(function (e) {
+          C.acquiring = null;
+          reject(e);
+        });
+      }, 5000);
+      grab({ mode: "exclusive" }).then(function () {
+        clearTimeout(timer);
+      }, function (e) {
+        clearTimeout(timer);
+
+        if (!stole) { C.acquiring = null; reject(e); }
+      });
+    });
+    return C.acquiring;
+  };
+
+  globalThis.__tk_coop_maybe_release = function () {
+    if (!C.held || !C.want) return;
+    if (globalThis.__tk_coop_busy) return;
+    globalThis.__tk_coop_release();
+  };
+
+  globalThis.__tk_coop_release = function () {
+    if (!C.held) return;
+    closeAll();
+    C.held = false;
+    C.want = false;
+    var r = C.releaseLock;
+    C.releaseLock = null;
+    if (r) r();
+  };
+
+  globalThis.__tk_coop_held = function () { return C.held; };
+
   globalThis.__tk_sah_file_size = function (path) {
-    var pool = Module._sahPool;
-    if (!pool || !(path in pool.pathMap)) return -1;
-    var sah = pool.files[pool.pathMap[path]].sah;
+    if (!C.held || !(path in C.pathMap)) return -1;
+    var sah = C.files[C.pathMap[path]].sah;
     var total = sah.getSize();
     return total > 4096 ? total - 4096 : 0;
   };
   globalThis.__tk_sah_read_chunk = function (path, off, len) {
-    var pool = Module._sahPool;
-    if (!pool || !(path in pool.pathMap)) return null;
-    var sah = pool.files[pool.pathMap[path]].sah;
+    if (!C.held || !(path in C.pathMap)) return null;
+    var sah = C.files[C.pathMap[path]].sah;
     var buf = new Uint8Array(len);
     var got = sah.read(buf, { at: 4096 + off });
     return got < len ? buf.subarray(0, got) : buf;
@@ -633,16 +757,19 @@ EM_JS(void, tk_sah_setup, (), {
 });
 
 EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
-  var pool = Module._sahPool;
+  var C = Module._coop;
   var path = UTF8ToString(cpath);
-  if (path in pool.pathMap)
-    return pool.pathMap[path];
-  for (var i = 0; i < pool.files.length; i++) {
-    if (pool.files[i].path.length === 0) {
-      var slot = pool.files[i];
+  if (path in C.pathMap)
+    return C.pathMap[path];
+
+
+  if (!C.held) return -1;
+  for (var i = 0; i < C.files.length; i++) {
+    if (C.files[i].path.length === 0) {
+      var slot = C.files[i];
       slot.path = path;
       slot.flags = flags;
-      pool.pathMap[path] = i;
+      C.pathMap[path] = i;
       var hdr = new Uint8Array(4096);
       for (var j = 0; j < path.length && j < 512; j++)
         hdr[j] = path.charCodeAt(j);
@@ -662,8 +789,9 @@ EM_JS(void, tk_sah_xclose, (int fid), {
 });
 
 EM_JS(int, tk_sah_xread, (int fid, unsigned char *buf, int n, double off), {
-  var pool = Module._sahPool;
-  var sah = pool.files[fid].sah;
+  var C = Module._coop;
+  var sah = C.files[fid].sah;
+  if (!sah) return 10;
   var tmp = new Uint8Array(n);
   var nread = sah.read(tmp, { at: 4096 + off });
   HEAPU8.set(tmp.subarray(0, nread), buf);
@@ -675,51 +803,60 @@ EM_JS(int, tk_sah_xread, (int fid, unsigned char *buf, int n, double off), {
 });
 
 EM_JS(int, tk_sah_xwrite, (const unsigned char *buf, int n, double off, int fid), {
-  var pool = Module._sahPool;
-  var sah = pool.files[fid].sah;
+  var C = Module._coop;
+  var sah = C.files[fid].sah;
+  if (!sah) return 10;
   var data = HEAPU8.slice(buf, buf + n);
   sah.write(data, { at: 4096 + off });
   return 0;
 });
 
 EM_JS(double, tk_sah_xfilesize, (int fid), {
-  var pool = Module._sahPool;
-  var sah = pool.files[fid].sah;
+  var C = Module._coop;
+  var sah = C.files[fid].sah;
+  if (!sah) return 0;
   var sz = sah.getSize();
   return sz > 4096 ? sz - 4096 : 0;
 });
 
 EM_JS(int, tk_sah_xtruncate, (int fid, double sz), {
-  var pool = Module._sahPool;
-  var sah = pool.files[fid].sah;
+  var C = Module._coop;
+  var sah = C.files[fid].sah;
+  if (!sah) return 10;
   sah.truncate(4096 + sz);
   return 0;
 });
 
 EM_JS(void, tk_sah_xsync, (int fid), {
-  var pool = Module._sahPool;
-  pool.files[fid].sah.flush();
+  var C = Module._coop;
+  var sah = C.files[fid].sah;
+  if (sah) sah.flush();
 });
 
 EM_JS(int, tk_sah_xaccess, (const char *cpath), {
-  var pool = Module._sahPool;
+  var C = Module._coop;
   var path = UTF8ToString(cpath);
-  return (path in pool.pathMap) ? 1 : 0;
+  return (path in C.pathMap) ? 1 : 0;
 });
 
 EM_JS(void, tk_sah_xdelete, (const char *cpath), {
-  var pool = Module._sahPool;
+  var C = Module._coop;
   var path = UTF8ToString(cpath);
-  if (!(path in pool.pathMap)) return;
-  var fid = pool.pathMap[path];
-  var slot = pool.files[fid];
+  if (!(path in C.pathMap)) return;
+  var fid = C.pathMap[path];
+  var slot = C.files[fid];
+  if (!slot.sah) return;
   var hdr = new Uint8Array(4096);
   slot.sah.write(hdr, { at: 0 });
   slot.sah.truncate(4096);
   slot.sah.flush();
   slot.path = "";
   slot.flags = 0;
-  delete pool.pathMap[path];
+  delete C.pathMap[path];
+});
+
+EM_JS(int, tk_coop_held, (), {
+  return Module._coop && Module._coop.held ? 1 : 0;
 });
 
 typedef struct {
@@ -761,7 +898,17 @@ static int sah_io_filesize (sqlite3_file *pFile, sqlite3_int64 *pSize) {
   return SQLITE_OK;
 }
 
-static int sah_io_lock (sqlite3_file *p, int l) { (void) p; (void) l; return SQLITE_OK; }
+
+
+
+
+
+
+
+static int sah_io_lock (sqlite3_file *p, int l) {
+  (void) p; (void) l;
+  return tk_coop_held() ? SQLITE_OK : SQLITE_BUSY;
+}
 static int sah_io_unlock (sqlite3_file *p, int l) { (void) p; (void) l; return SQLITE_OK; }
 static int sah_io_check_reserved (sqlite3_file *p, int *r) { (void) p; *r = 0; return SQLITE_OK; }
 static int sah_io_file_control (sqlite3_file *p, int o, void *a) { (void) p; (void) o; (void) a; return SQLITE_NOTFOUND; }
