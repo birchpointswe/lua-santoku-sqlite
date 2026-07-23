@@ -122,6 +122,25 @@ static int db_last_insert_rowid (lua_State *L) {
   return 1;
 }
 
+
+
+
+
+
+
+static int db_reset_cache (lua_State *L) {
+  tk_sqlite_db *db = check_db(L, 1);
+  if (!db->handle)
+    return 0;
+  sqlite3_stmt *s = NULL;
+  while ((s = sqlite3_next_stmt(db->handle, s)) != NULL)
+    sqlite3_reset(s);
+#ifdef SQLITE_FCNTL_RESET_CACHE
+  sqlite3_file_control(db->handle, "main", SQLITE_FCNTL_RESET_CACHE, NULL);
+#endif
+  return 0;
+}
+
 static int db_gc (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
   if (db->handle) {
@@ -485,6 +504,7 @@ static luaL_Reg db_methods[] = {
   { "close", db_close },
   { "close_vm", db_close_vm },
   { "last_insert_rowid", db_last_insert_rowid },
+  { "reset_cache", db_reset_cache },
   { NULL, NULL }
 };
 
@@ -586,6 +606,17 @@ static int tk_open_v2 (lua_State *L) {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
 EM_JS(void, tk_sah_setup, (), {
   if (Module._coop) return;
   var C = Module._coop = {
@@ -595,41 +626,12 @@ EM_JS(void, tk_sah_setup, (), {
     dirHandle: null,
     opaqueHandle: null,
     held: false,
-    want: false,
     releaseLock: null,
     acquiring: null,
-    bc: null,
     lockName: null,
+    gen: 0,
+    counters: {},
   };
-
-  async function openAll (retries) {
-    for (var i = 0; i < C.files.length; i++) {
-      var slot = C.files[i];
-      if (slot.sah) continue;
-      for (var attempt = 0; ; attempt++) {
-        try {
-          slot.sah = await slot.fh.createSyncAccessHandle();
-          break;
-        } catch (e) {
-
-
-          if (attempt >= retries) throw e;
-          await new Promise(function (r) { setTimeout(r, 250); });
-        }
-      }
-    }
-  }
-
-  function closeAll () {
-    for (var i = 0; i < C.files.length; i++) {
-      var slot = C.files[i];
-      if (slot.sah) {
-        try { slot.sah.flush(); } catch (e) {}
-        try { slot.sah.close(); } catch (e) {}
-        slot.sah = null;
-      }
-    }
-  }
 
   function rescan () {
     C.pathMap = {};
@@ -652,18 +654,53 @@ EM_JS(void, tk_sah_setup, (), {
     }
   }
 
+
+
+  function db_counters () {
+    var out = {};
+    for (var i = 0; i < C.files.length; i++) {
+      var slot = C.files[i];
+      if (slot.path.length > 0 && (slot.flags & 0x100)) {
+        var buf = new Uint8Array(4);
+        var got = slot.sah.read(buf, { at: 4096 + 24 });
+        out[slot.name] = got >= 4
+          ? ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0
+          : 0;
+      }
+    }
+    return out;
+  }
+
+  function counters_changed (prev, cur) {
+    for (var k in cur) {
+      if (prev[k] !== cur[k]) return true;
+    }
+    return false;
+  }
+
   globalThis.__tk_coop_init = async function (dir, capacity) {
     var root = await navigator.storage.getDirectory();
     C.dirHandle = await root.getDirectoryHandle(dir, { create: true });
     C.opaqueHandle = await C.dirHandle.getDirectoryHandle(".opaque", { create: true });
     C.lockName = "tk-coop:" + dir;
-    C.bc = new BroadcastChannel(C.lockName);
-    C.bc.onmessage = function (ev) {
-      if (ev && ev.data === "want") {
-        C.want = true;
-        globalThis.__tk_coop_maybe_release();
-      }
-    };
+
+
+
+
+
+
+    var probe = await C.dirHandle.getFileHandle(".rw-unsafe-probe", { create: true });
+    var p1 = null, p2 = null;
+    try {
+      p1 = await probe.createSyncAccessHandle({ mode: "readwrite-unsafe" });
+      p2 = await probe.createSyncAccessHandle({ mode: "readwrite-unsafe" });
+    } catch (e) {
+      throw new Error("OPFS readwrite-unsafe access handles unsupported (browser too old): " + e);
+    } finally {
+      try { if (p2) p2.close(); } catch (e) {}
+      try { if (p1) p1.close(); } catch (e) {}
+    }
+
     var existing = [];
     for await (var entry of C.opaqueHandle.values()) {
       if (entry.kind === "file") existing.push(entry.name);
@@ -674,7 +711,8 @@ EM_JS(void, tk_sah_setup, (), {
       names.push(String(k).padStart(8, "0"));
     for (var i = 0; i < names.length; i++) {
       var fh = await C.opaqueHandle.getFileHandle(names[i], { create: true });
-      C.files.push({ name: names[i], fh: fh, sah: null, path: "", flags: 0 });
+      var sah = await fh.createSyncAccessHandle({ mode: "readwrite-unsafe" });
+      C.files.push({ name: names[i], fh: fh, sah: sah, path: "", flags: 0, dirty: false });
     }
     C.capacity = C.files.length;
   };
@@ -683,63 +721,57 @@ EM_JS(void, tk_sah_setup, (), {
     if (C.held) return Promise.resolve();
     if (C.acquiring) return C.acquiring;
     C.acquiring = new Promise(function (resolve, reject) {
-      try { C.bc.postMessage("want"); } catch (e) {}
-      var stole = false;
-      function grab (opts) {
-        return navigator.locks.request(C.lockName, opts, function () {
+      navigator.locks.request(C.lockName, { mode: "exclusive" }, function () {
+        rescan();
+        var cur = db_counters();
+        if (counters_changed(C.counters, cur)) {
 
 
-
-
-          return openAll(80).then(function () {
-            rescan();
-            C.held = true;
-            C.want = false;
-            C.acquiring = null;
-            resolve();
-            return new Promise(function (release) { C.releaseLock = release; });
-          });
-        });
-      }
-      var timer = setTimeout(function () {
-
-
-
-        if (C.held || C.acquiring === null || stole) return;
-        stole = true;
-        grab({ mode: "exclusive", steal: true }).catch(function (e) {
+          C.gen = C.gen + 1;
+        }
+        C.counters = cur;
+        C.held = true;
+        C.acquiring = null;
+        resolve();
+        return new Promise(function (release) { C.releaseLock = release; });
+      }).catch(function (e) {
+        if (C.acquiring !== null) {
           C.acquiring = null;
           reject(e);
-        });
-      }, 5000);
-      grab({ mode: "exclusive" }).then(function () {
-        clearTimeout(timer);
-      }, function (e) {
-        clearTimeout(timer);
-
-        if (!stole) { C.acquiring = null; reject(e); }
+        }
+        if (C.held) {
+          C.held = false;
+          C.releaseLock = null;
+        }
       });
     });
     return C.acquiring;
   };
 
   globalThis.__tk_coop_maybe_release = function () {
-    if (!C.held || !C.want) return;
     if (globalThis.__tk_coop_busy) return;
     globalThis.__tk_coop_release();
   };
 
   globalThis.__tk_coop_release = function () {
     if (!C.held) return;
-    closeAll();
+    for (var i = 0; i < C.files.length; i++) {
+      var slot = C.files[i];
+      if (slot.dirty) {
+        try { slot.sah.flush(); } catch (e) {}
+        slot.dirty = false;
+      }
+    }
+    C.counters = db_counters();
     C.held = false;
-    C.want = false;
     var r = C.releaseLock;
     C.releaseLock = null;
     if (r) r();
   };
 
   globalThis.__tk_coop_held = function () { return C.held; };
+
+  globalThis.__tk_coop_gen = function () { return C.gen; };
 
   globalThis.__tk_sah_file_size = function (path) {
     if (!C.held || !(path in C.pathMap)) return -1;
@@ -804,10 +836,11 @@ EM_JS(int, tk_sah_xread, (int fid, unsigned char *buf, int n, double off), {
 
 EM_JS(int, tk_sah_xwrite, (const unsigned char *buf, int n, double off, int fid), {
   var C = Module._coop;
-  var sah = C.files[fid].sah;
-  if (!sah) return 10;
+  var slot = C.files[fid];
+  if (!slot.sah) return 10;
   var data = HEAPU8.slice(buf, buf + n);
-  sah.write(data, { at: 4096 + off });
+  slot.sah.write(data, { at: 4096 + off });
+  slot.dirty = true;
   return 0;
 });
 
@@ -821,16 +854,20 @@ EM_JS(double, tk_sah_xfilesize, (int fid), {
 
 EM_JS(int, tk_sah_xtruncate, (int fid, double sz), {
   var C = Module._coop;
-  var sah = C.files[fid].sah;
-  if (!sah) return 10;
-  sah.truncate(4096 + sz);
+  var slot = C.files[fid];
+  if (!slot.sah) return 10;
+  slot.sah.truncate(4096 + sz);
+  slot.dirty = true;
   return 0;
 });
 
 EM_JS(void, tk_sah_xsync, (int fid), {
   var C = Module._coop;
-  var sah = C.files[fid].sah;
-  if (sah) sah.flush();
+  var slot = C.files[fid];
+  if (slot.sah) {
+    slot.sah.flush();
+    slot.dirty = false;
+  }
 });
 
 EM_JS(int, tk_sah_xaccess, (const char *cpath), {
