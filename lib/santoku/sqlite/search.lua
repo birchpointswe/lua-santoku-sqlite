@@ -42,6 +42,17 @@ local function create (db, opts)
   if weighted == nil then weighted = true end
   local rawdb = db.db
 
+
+
+
+
+
+  local schema = opts.schema
+  if schema ~= nil then
+    assert(valid_name(schema), "search.create: opts.schema must be a valid identifier")
+  end
+  local tbl = schema and (schema .. "." .. name) or name
+
   local pcol = partition and (pname .. " text not null, ") or ""
   local ppk = partition and (pname .. ", ") or ""
   local idcols = partition and (pname .. ", id, ") or "id, "
@@ -49,13 +60,13 @@ local function create (db, opts)
   local tok_p = partition and 3 or 2
 
   local ddl =
-    "create table if not exists " .. name .. "_tf (" .. pcol .. "id, token integer not null" ..
+    "create table if not exists " .. tbl .. "_tf (" .. pcol .. "id, token integer not null" ..
     (weighted and ", tf real not null" or "") .. ");" ..
-    "create index if not exists " .. name .. "_tf_tok on " .. name .. "_tf (" .. ppk .. "token);" ..
-    "create index if not exists " .. name .. "_tf_id on " .. name .. "_tf (" .. ppk .. "id);"
+    "create index if not exists " .. tbl .. "_tf_tok on " .. name .. "_tf (" .. ppk .. "token);" ..
+    "create index if not exists " .. tbl .. "_tf_id on " .. name .. "_tf (" .. ppk .. "id);"
   if weighted then
     ddl = ddl ..
-      "create table if not exists " .. name .. "_doc (" .. pcol ..
+      "create table if not exists " .. tbl .. "_doc (" .. pcol ..
       "id, norm real not null, primary key (" .. ppk .. "id));"
   end
   db.exec(ddl)
@@ -63,30 +74,30 @@ local function create (db, opts)
   local insert_tf, insert_tf_counted, insert_doc, insert_doc_counted
   if weighted then
     insert_tf = rawdb:prepare(
-      "insert into " .. name .. "_tf (" .. idcols .. "token, tf) " ..
+      "insert into " .. tbl .. "_tf (" .. idcols .. "token, tf) " ..
       "select " .. idsel .. ", t.value, w.value " ..
       "from carray(?" .. tok_p .. ") t join carray(?" .. (tok_p + 1) .. ") w on t.rowid = w.rowid")
     insert_tf_counted = rawdb:prepare(
-      "insert into " .. name .. "_tf (" .. idcols .. "token, tf) " ..
+      "insert into " .. tbl .. "_tf (" .. idcols .. "token, tf) " ..
       "select " .. idsel .. ", t.value, count(*) " ..
       "from carray(?" .. tok_p .. ") t group by t.value")
     insert_doc = rawdb:prepare(
-      "insert into " .. name .. "_doc (" .. idcols .. "norm) " ..
+      "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
       "select " .. idsel .. ", sqrt(sum(w.value * w.value)) from carray(?" .. tok_p .. ") w")
     insert_doc_counted = rawdb:prepare(
-      "insert into " .. name .. "_doc (" .. idcols .. "norm) " ..
+      "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
       "select " .. idsel .. ", sqrt(sum(c * c)) " ..
       "from (select count(*) c from carray(?" .. tok_p .. ") t group by t.value)")
   else
     insert_tf = rawdb:prepare(
-      "insert into " .. name .. "_tf (" .. idcols .. "token) " ..
+      "insert into " .. tbl .. "_tf (" .. idcols .. "token) " ..
       "select " .. idsel .. ", t.value from carray(?" .. tok_p .. ") t")
   end
 
   local s_limit_p = partition and 2 or 1
   local s_qtok_p = partition and 3 or 2
   local s_qval_p = s_qtok_p + 1
-  local docjoin = "join " .. name .. "_doc d on " ..
+  local docjoin = "join " .. tbl .. "_doc d on " ..
     (partition and ("d." .. pname .. " = s." .. pname .. " and ") or "") .. "d.id = s.id "
   local pwhere = partition and ("where s." .. pname .. " = ?1 ") or ""
   local search_stmt, search_stmt_counted
@@ -94,7 +105,7 @@ local function create (db, opts)
     search_stmt = rawdb:prepare(
       "select s.id as id, sum(s.tf * q.tf) / " ..
       "(d.norm * (select sqrt(sum(value * value)) from carray(?" .. s_qval_p .. "))) as score " ..
-      "from " .. name .. "_tf s " ..
+      "from " .. tbl .. "_tf s " ..
       "join (select t.value as token, w.value as tf from carray(?" .. s_qtok_p .. ") t " ..
       "join carray(?" .. s_qval_p .. ") w on t.rowid = w.rowid) q on s.token = q.token " ..
       docjoin .. pwhere ..
@@ -103,7 +114,7 @@ local function create (db, opts)
       "select s.id as id, sum(s.tf * q.tf) / " ..
       "(d.norm * (select sqrt(sum(c * c)) from " ..
       "(select count(*) c from carray(?" .. s_qtok_p .. ") t group by t.value))) as score " ..
-      "from " .. name .. "_tf s " ..
+      "from " .. tbl .. "_tf s " ..
       "join (select t.value as token, count(*) as tf from carray(?" .. s_qtok_p .. ") t " ..
       "group by t.value) q on s.token = q.token " ..
       docjoin .. pwhere ..
@@ -111,7 +122,7 @@ local function create (db, opts)
   else
     search_stmt = rawdb:prepare(
       "select s.id as id, count(*) as score " ..
-      "from " .. name .. "_tf s " ..
+      "from " .. tbl .. "_tf s " ..
       "join (select value as token from carray(?" .. s_qtok_p .. ")) q on s.token = q.token " ..
       pwhere ..
       "group by s.id order by score desc limit ?" .. s_limit_p)
@@ -119,18 +130,18 @@ local function create (db, opts)
 
   local del_tf, del_doc, clear_tf, clear_doc
   if partition then
-    del_tf = db.runner("delete from " .. name .. "_tf where " .. pname .. " = ?1 and id = ?2")
-    clear_tf = db.runner("delete from " .. name .. "_tf where " .. pname .. " = ?1")
+    del_tf = db.runner("delete from " .. tbl .. "_tf where " .. pname .. " = ?1 and id = ?2")
+    clear_tf = db.runner("delete from " .. tbl .. "_tf where " .. pname .. " = ?1")
     if weighted then
-      del_doc = db.runner("delete from " .. name .. "_doc where " .. pname .. " = ?1 and id = ?2")
-      clear_doc = db.runner("delete from " .. name .. "_doc where " .. pname .. " = ?1")
+      del_doc = db.runner("delete from " .. tbl .. "_doc where " .. pname .. " = ?1 and id = ?2")
+      clear_doc = db.runner("delete from " .. tbl .. "_doc where " .. pname .. " = ?1")
     end
   else
-    del_tf = db.runner("delete from " .. name .. "_tf where id = ?1")
-    clear_tf = db.runner("delete from " .. name .. "_tf")
+    del_tf = db.runner("delete from " .. tbl .. "_tf where id = ?1")
+    clear_tf = db.runner("delete from " .. tbl .. "_tf")
     if weighted then
-      del_doc = db.runner("delete from " .. name .. "_doc where id = ?1")
-      clear_doc = db.runner("delete from " .. name .. "_doc")
+      del_doc = db.runner("delete from " .. tbl .. "_doc where id = ?1")
+      clear_doc = db.runner("delete from " .. tbl .. "_doc")
     end
   end
 

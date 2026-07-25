@@ -9,6 +9,8 @@
 #include <emscripten/html5.h>
 #endif
 
+#include "enc.h"
+
 #define TK_SQLITE_DB_MT "santoku_sqlite_db"
 #define TK_SQLITE_STMT_MT "santoku_sqlite_stmt"
 
@@ -17,7 +19,18 @@ typedef struct tk_sqlite_stmt tk_sqlite_stmt;
 typedef struct {
   sqlite3 *handle;
   tk_sqlite_stmt *stmts;
+
+
+  char *enc_path;
 } tk_sqlite_db;
+
+static void db_release_key (tk_sqlite_db *db) {
+  if (db->enc_path) {
+    tk_enc_key_unregister(db->enc_path);
+    free(db->enc_path);
+    db->enc_path = NULL;
+  }
+}
 
 struct tk_sqlite_stmt {
   sqlite3_stmt *handle;
@@ -96,8 +109,10 @@ static int db_close (lua_State *L) {
   int rc = SQLITE_OK;
   if (db->handle) {
     rc = sqlite3_close(db->handle);
-    if (rc == SQLITE_OK)
+    if (rc == SQLITE_OK) {
       db->handle = NULL;
+      db_release_key(db);
+    }
   }
   lua_pushinteger(L, rc);
   return 1;
@@ -155,6 +170,7 @@ static int db_gc (lua_State *L) {
     sqlite3_close_v2(db->handle);
     db->handle = NULL;
   }
+  db_release_key(db);
   return 0;
 }
 
@@ -540,6 +556,7 @@ static int push_db (lua_State *L, sqlite3 *raw) {
   tk_sqlite_db *db = (tk_sqlite_db *) lua_newuserdata(L, sizeof(tk_sqlite_db));
   db->handle = raw;
   db->stmts = NULL;
+  db->enc_path = NULL;
   luaL_getmetatable(L, TK_SQLITE_DB_MT);
   lua_setmetatable(L, -2);
   return 1;
@@ -583,6 +600,171 @@ static int tk_open_v2 (lua_State *L) {
     return 1;
   }
   return push_db(L, raw);
+}
+
+
+
+
+static char *tk_enc_fullpath (const char *path, const char *parent,
+                              const char **vfsname, const char **err) {
+  sqlite3_initialize();
+  const char *vfs = tk_enc_vfs_ensure(parent);
+  if (!vfs) {
+    *err = "could not register encrypting vfs";
+    return NULL;
+  }
+  sqlite3_vfs *shim = sqlite3_vfs_find(vfs);
+  if (!shim) {
+    *err = "encrypting vfs missing";
+    return NULL;
+  }
+  int n = shim->mxPathname > 0 ? shim->mxPathname + 1 : 1024;
+  char *full = (char *) malloc((size_t) n);
+  if (!full) {
+    *err = "out of memory";
+    return NULL;
+  }
+  if (shim->xFullPathname(shim, path, n, full) != SQLITE_OK) {
+    free(full);
+    *err = "could not resolve path";
+    return NULL;
+  }
+  if (vfsname)
+    *vfsname = vfs;
+  return full;
+}
+
+
+
+
+
+
+
+
+static int tk_key_set (lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+  size_t klen = 0;
+  const char *key = luaL_checklstring(L, 2, &klen);
+  const char *parent = luaL_optstring(L, 3, NULL);
+  if (klen != TK_ENC_KEYLEN) {
+    lua_pushnil(L);
+    lua_pushstring(L, "key must be exactly 32 bytes");
+    return 2;
+  }
+  const char *err = NULL;
+  char *full = tk_enc_fullpath(path, parent, NULL, &err);
+  if (!full) {
+    lua_pushnil(L);
+    lua_pushstring(L, err);
+    return 2;
+  }
+  int rc = tk_enc_key_register(full, (const unsigned char *) key);
+  free(full);
+  if (rc != SQLITE_OK) {
+    lua_pushnil(L);
+    lua_pushstring(L, rc == SQLITE_MISUSE
+      ? "path already registered with a different key"
+      : "out of memory");
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+
+
+
+
+
+
+
+static int tk_enc_vfs_name (lua_State *L) {
+  const char *parent = luaL_optstring(L, 1, NULL);
+  sqlite3_initialize();
+  const char *vfs = tk_enc_vfs_ensure(parent);
+  if (!vfs) {
+    lua_pushnil(L);
+    lua_pushstring(L, "could not register encrypting vfs");
+    return 2;
+  }
+  lua_pushstring(L, vfs);
+  return 1;
+}
+
+
+
+static int tk_key_clear (lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+  const char *parent = luaL_optstring(L, 2, NULL);
+  const char *err = NULL;
+  char *full = tk_enc_fullpath(path, parent, NULL, &err);
+  if (!full) {
+    lua_pushnil(L);
+    lua_pushstring(L, err);
+    return 2;
+  }
+  tk_enc_key_unregister(full);
+  free(full);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+
+
+
+
+
+
+
+
+
+
+static int tk_open_encrypted (lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+  size_t klen = 0;
+  const char *key = luaL_checklstring(L, 2, &klen);
+  const char *parent = luaL_optstring(L, 3, NULL);
+  if (klen != TK_ENC_KEYLEN) {
+    lua_pushnil(L);
+    lua_pushstring(L, "key must be exactly 32 bytes");
+    return 2;
+  }
+
+
+  const char *vfs = NULL;
+  const char *perr = NULL;
+  char *full = tk_enc_fullpath(path, parent, &vfs, &perr);
+  if (!full) {
+    lua_pushnil(L);
+    lua_pushstring(L, perr);
+    return 2;
+  }
+  int krc = tk_enc_key_register(full, (const unsigned char *) key);
+  if (krc != SQLITE_OK) {
+    free(full);
+    lua_pushnil(L);
+    lua_pushstring(L, krc == SQLITE_MISUSE
+      ? "database already open with a different key"
+      : "out of memory");
+    return 2;
+  }
+  sqlite3 *raw = NULL;
+  int rc = sqlite3_open_v2(path, &raw,
+    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, vfs);
+  if (rc != SQLITE_OK) {
+
+    const char *msg = raw ? sqlite3_errmsg(raw) : "could not open database";
+    lua_pushnil(L);
+    lua_pushstring(L, msg);
+    if (raw) sqlite3_close_v2(raw);
+    tk_enc_key_unregister(full);
+    free(full);
+    return 2;
+  }
+  push_db(L, raw);
+  tk_sqlite_db *db = (tk_sqlite_db *) lua_touserdata(L, -1);
+  db->enc_path = full;
+  return 1;
 }
 
 #ifdef __EMSCRIPTEN__
@@ -656,16 +838,37 @@ EM_JS(void, tk_sah_setup, (), {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
   function db_counters () {
     var out = {};
     for (var i = 0; i < C.files.length; i++) {
       var slot = C.files[i];
       if (slot.path.length > 0 && (slot.flags & 0x100)) {
-        var buf = new Uint8Array(4);
-        var got = slot.sah.read(buf, { at: 4096 + 24 });
-        out[slot.name] = got >= 4
-          ? ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0
-          : 0;
+
+
+        var buf = new Uint8Array(68);
+        var got = slot.sah.read(buf, { at: 4096 });
+        if (got >= 68 &&
+            buf[0] === 0x54 && buf[1] === 0x4b && buf[2] === 0x53 && buf[3] === 0x51 &&
+            buf[4] === 0x45 && buf[5] === 0x4e && buf[6] === 0x43 && buf[7] === 0x31) {
+          out[slot.name] =
+            ((buf[64] << 24) | (buf[65] << 16) | (buf[66] << 8) | buf[67]) >>> 0;
+        } else {
+          out[slot.name] = got >= 28
+            ? ((buf[24] << 24) | (buf[25] << 16) | (buf[26] << 8) | buf[27]) >>> 0
+            : 0;
+        }
       }
     }
     return out;
@@ -1061,6 +1264,14 @@ int luaopen_santoku_sqlite_db (lua_State *L) {
   lua_setfield(L, -2, "open_memory");
   lua_pushcfunction(L, tk_open_v2);
   lua_setfield(L, -2, "open_v2");
+  lua_pushcfunction(L, tk_open_encrypted);
+  lua_setfield(L, -2, "open_encrypted");
+  lua_pushcfunction(L, tk_key_set);
+  lua_setfield(L, -2, "key_set");
+  lua_pushcfunction(L, tk_key_clear);
+  lua_setfield(L, -2, "key_clear");
+  lua_pushcfunction(L, tk_enc_vfs_name);
+  lua_setfield(L, -2, "enc_vfs");
   lua_pushinteger(L, SQLITE_OK);
   lua_setfield(L, -2, "OK");
   lua_pushinteger(L, SQLITE_ERROR);

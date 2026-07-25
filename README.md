@@ -80,6 +80,83 @@ db.close()
 
 Anchor test: `test/spec/santoku/sqlite.lua`.
 
+## Encrypted databases
+
+`sqlite.open_encrypted(path, key, [parent_vfs])` opens a database whose every
+byte on disk is encrypted — pages, rollback journal and transient files alike.
+`key` must be exactly 32 raw bytes (`santoku-monocypher`'s `key:bytes()` /
+`key:derive(label):bytes()` produce one). `parent_vfs` names the VFS to sit on
+top of, defaulting to the platform default; pass `"opfs-coop"` in the browser.
+
+```lua
+local sqlite = require("santoku.sqlite.db")
+local sql    = require("santoku.sqlite")
+
+local raw = sqlite.open_encrypted("notes.db", key)   -- key = 32 raw bytes
+local db  = sql(raw)
+db.exec([[ create table notes (id integer primary key, body text) ]])
+db.runner("insert into notes (id, body) values (?, ?)")(1, "secret")
+raw:close_vm()                                       -- finalize cached statements
+raw:close()                                          -- releases the key
+```
+
+On disk the file starts with a `TKSQENC1` container header (magic, version,
+block size, logical size, per-file salt) followed by one frame per block:
+`nonce(24) || ciphertext || tag(16)`. Because the shim remaps offsets and
+reports the logical size itself, no reserved-bytes pragma is needed and the
+journal is covered too — the SQLite header, schema and row data never appear in
+cleartext. Each block is sealed with XChaCha20-Poly1305 under a fresh random
+nonce on every write, with the file salt and block index as associated data, so
+blocks cannot be reordered, replayed or moved between files, and a wrong key or
+tampered page fails the read rather than returning garbage.
+
+### Cross-database reads
+
+`ATTACH` works across databases with *different* keys, which is how you query
+several encrypted databases at once. SQLite opens an attached file itself, so
+its key must be registered up front with `key_set(path, key, [parent_vfs])`
+(released with `key_clear`; registrations are refcounted and `open_encrypted`
+counts as one).
+
+Attached databases inherit the **connection's** VFS, so the connection has to be
+on the encrypting VFS already — a plain connection cannot read an encrypted
+attach. `enc_vfs([parent_vfs])` returns the shim's name for exactly this, which
+lets the merging connection keep an in-memory `main` and persist nothing:
+
+```lua
+sqlite.key_set("a.db", key_a)
+sqlite.key_set("b.db", key_b)
+
+local raw = sqlite.open_v2(":memory:", sqlite.enc_vfs())  -- main is in-memory
+local db  = sql(raw)
+db.exec("attach database 'a.db' as s1")
+db.exec("attach database 'b.db' as s2")
+db.getter("select count(*) as n from (select id from s1.notes union all select id from s2.notes)", "n")()
+```
+
+Keep such a connection read-only: a transaction spanning two attached databases
+makes SQLite create a super-journal, which the shim cannot key (it would get an
+ephemeral key, so crash *recovery* would fail). Writing to one database per
+transaction avoids super-journals entirely.
+
+`search.create(db, { name = ..., schema = "s1" })` puts a search index in an
+attached schema so it can participate in these cross-database queries.
+
+Notes and limits:
+
+- WAL is not available through the shim (its io-methods are iVersion 1); keep
+  the database in a rollback journal mode.
+- `SQLITE_MAX_ATTACHED` is the stock 10, so at most ten databases at once.
+- Reopening a path that is still open with a *different* key is refused
+  (`"database already open with a different key"`) rather than silently reusing
+  the registered one.
+- The key is released when the connection closes; call `close_vm()` first so
+  `close()` is not blocked by cached statements.
+- Requires `santoku-monocypher` (its crypto core is header-only), so the project
+  keeps a single crypto implementation.
+
+Anchor test: `test/spec/santoku/sqlite/enc.lua`.
+
 ## Query-closure factories
 
 All factories prepare the SQL once and return a closure. The closure binds its arguments

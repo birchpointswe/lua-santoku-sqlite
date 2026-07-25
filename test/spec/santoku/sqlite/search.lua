@@ -229,3 +229,31 @@ test("transaction wrapping rolls back a failed batch", function ()
   assert(eq(#idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10), 1))
 
 end)
+
+test("schema: index lives in an attached database", function ()
+
+  local db = sql(sqlite.open_memory())
+  db.exec("attach database ':memory:' as side")
+
+
+  local idx = search.create(db, { name = "docs", schema = "side" })
+
+  idx.add(
+    { "a", "b" },
+    mkcsr({ 0, 3, 6 }, { 1, 2, 3, 2, 3, 4 }, { 1, 1, 1, 1, 1, 1 }))
+
+  local res = idx.search(mkcsr({ 0, 2 }, { 2, 3 }, { 1, 1 }), 10)
+  assert(eq(#res, 2))
+
+
+  local n = db.getter("select count(*) as n from side.docs_tf", "n")()
+  assert(n > 0)
+  local inmain = db.getter(
+    "select count(*) as n from main.sqlite_master where name = 'docs_tf'", "n")()
+  assert(eq(inmain, 0))
+
+  idx.remove({ "a" })
+  local res2 = idx.search(mkcsr({ 0, 2 }, { 2, 3 }, { 1, 1 }), 10)
+  assert(eq(#res2, 1))
+
+end)
