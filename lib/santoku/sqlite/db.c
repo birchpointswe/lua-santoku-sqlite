@@ -989,6 +989,26 @@ EM_JS(void, tk_sah_setup, (), {
     var got = sah.read(buf, { at: 4096 + off });
     return got < len ? buf.subarray(0, got) : buf;
   };
+  globalThis.__tk_sah_delete = function (path) {
+    if (!C.held || !(path in C.pathMap)) return false;
+    var fid = C.pathMap[path];
+    var slot = C.files[fid];
+    if (!slot.sah) return false;
+    var hdr = new Uint8Array(4096);
+    slot.sah.write(hdr, { at: 0 });
+    slot.sah.truncate(4096);
+    slot.sah.flush();
+    slot.path = "";
+    slot.flags = 0;
+    delete C.pathMap[path];
+    return true;
+  };
+  globalThis.__tk_sah_list = function () {
+    if (!C.held) return null;
+    var out = [];
+    for (var p in C.pathMap) out.push(p);
+    return out;
+  };
 });
 
 EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
