@@ -19,8 +19,6 @@ typedef struct tk_sqlite_stmt tk_sqlite_stmt;
 typedef struct {
   sqlite3 *handle;
   tk_sqlite_stmt *stmts;
-
-
   char *enc_path;
 } tk_sqlite_db;
 
@@ -136,12 +134,6 @@ static int db_last_insert_rowid (lua_State *L) {
   lua_pushnumber(L, (lua_Number) sqlite3_last_insert_rowid(db->handle));
   return 1;
 }
-
-
-
-
-
-
 
 static int db_reset_cache (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
@@ -602,9 +594,6 @@ static int tk_open_v2 (lua_State *L) {
   return push_db(L, raw);
 }
 
-
-
-
 static char *tk_enc_fullpath (const char *path, const char *parent,
                               const char **vfsname, const char **err) {
   sqlite3_initialize();
@@ -633,13 +622,6 @@ static char *tk_enc_fullpath (const char *path, const char *parent,
     *vfsname = vfs;
   return full;
 }
-
-
-
-
-
-
-
 
 static int tk_key_set (lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
@@ -671,13 +653,6 @@ static int tk_key_set (lua_State *L) {
   return 1;
 }
 
-
-
-
-
-
-
-
 static int tk_enc_vfs_name (lua_State *L) {
   const char *parent = luaL_optstring(L, 1, NULL);
   sqlite3_initialize();
@@ -690,8 +665,6 @@ static int tk_enc_vfs_name (lua_State *L) {
   lua_pushstring(L, vfs);
   return 1;
 }
-
-
 
 static int tk_key_clear (lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
@@ -709,16 +682,6 @@ static int tk_key_clear (lua_State *L) {
   return 1;
 }
 
-
-
-
-
-
-
-
-
-
-
 static int tk_open_encrypted (lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
   size_t klen = 0;
@@ -729,7 +692,6 @@ static int tk_open_encrypted (lua_State *L) {
     lua_pushstring(L, "key must be exactly 32 bytes");
     return 2;
   }
-
 
   const char *vfs = NULL;
   const char *perr = NULL;
@@ -772,33 +734,6 @@ static int tk_open_encrypted (lua_State *L) {
 #define SAH_PATH_MAX 512
 #define SAH_VFS_NAME "opfs-coop"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 EM_JS(void, tk_sah_setup, (), {
   if (Module._coop) return;
   var C = Module._coop = {
@@ -836,26 +771,11 @@ EM_JS(void, tk_sah_setup, (), {
     }
   }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   function db_counters () {
     var out = {};
     for (var i = 0; i < C.files.length; i++) {
       var slot = C.files[i];
       if (slot.path.length > 0 && (slot.flags & 0x100)) {
-
 
         var buf = new Uint8Array(68);
         var got = slot.sah.read(buf, { at: 4096 });
@@ -886,11 +806,6 @@ EM_JS(void, tk_sah_setup, (), {
     C.dirHandle = await root.getDirectoryHandle(dir, { create: true });
     C.opaqueHandle = await C.dirHandle.getDirectoryHandle(".opaque", { create: true });
     C.lockName = "tk-coop:" + dir;
-
-
-
-
-
 
     var probe = await C.dirHandle.getFileHandle(".rw-unsafe-probe", { create: true });
     var p1 = null, p2 = null;
@@ -928,7 +843,6 @@ EM_JS(void, tk_sah_setup, (), {
         rescan();
         var cur = db_counters();
         if (counters_changed(C.counters, cur)) {
-
 
           C.gen = C.gen + 1;
         }
@@ -989,6 +903,32 @@ EM_JS(void, tk_sah_setup, (), {
     var got = sah.read(buf, { at: 4096 + off });
     return got < len ? buf.subarray(0, got) : buf;
   };
+  globalThis.__tk_sah_write_chunk = function (path, off, bytes) {
+    if (!C.held) return false;
+    var fid;
+    if (path in C.pathMap) {
+      fid = C.pathMap[path];
+    } else {
+      fid = -1;
+      for (var i = 0; i < C.files.length; i++) {
+        if (C.files[i].path.length === 0) { fid = i; break; }
+      }
+      if (fid < 0) return false;
+      var claimed = C.files[fid];
+      claimed.path = path;
+      claimed.flags = 0;
+      C.pathMap[path] = fid;
+      var hdr = new Uint8Array(4096);
+      for (var j = 0; j < path.length && j < 512; j++)
+        hdr[j] = path.charCodeAt(j);
+      claimed.sah.write(hdr, { at: 0 });
+    }
+    var slot = C.files[fid];
+    if (!slot.sah) return false;
+    slot.sah.write(bytes, { at: 4096 + off });
+    slot.dirty = true;
+    return true;
+  };
   globalThis.__tk_sah_delete = function (path) {
     if (!C.held || !(path in C.pathMap)) return false;
     var fid = C.pathMap[path];
@@ -1016,7 +956,6 @@ EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
   var path = UTF8ToString(cpath);
   if (path in C.pathMap)
     return C.pathMap[path];
-
 
   if (!C.held) return -1;
   for (var i = 0; i < C.files.length; i++) {
@@ -1157,13 +1096,6 @@ static int sah_io_filesize (sqlite3_file *pFile, sqlite3_int64 *pSize) {
   *pSize = (sqlite3_int64) tk_sah_xfilesize(f->fid);
   return SQLITE_OK;
 }
-
-
-
-
-
-
-
 
 static int sah_io_lock (sqlite3_file *p, int l) {
   (void) p; (void) l;

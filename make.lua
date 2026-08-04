@@ -1,14 +1,11 @@
 local env = {
   name = "santoku-sqlite",
-  version = "1.0.0-1",
+  version = "1.0.1-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,
   cflags = {
     "-I$(PWD)/deps/sqlite3/",
-
-
-
     "-I$(shell luarocks show santoku-monocypher --rock-dir)/include/",
   },
   ldflags = {
@@ -18,8 +15,6 @@ local env = {
   dependencies = {
     "lua == 5.1",
     "santoku >= 1.0.0, < 2.0.0",
-
-
     "santoku-monocypher >= 1.0.0, < 2.0.0",
   },
   test = {
