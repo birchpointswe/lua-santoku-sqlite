@@ -45,6 +45,7 @@ static void stmt_unlink (tk_sqlite_stmt *s) {
   if (s->next)
     s->next->prev = s->prev;
   s->prev = s->next = NULL;
+  s->db = NULL;
 }
 
 static void stmt_link (tk_sqlite_db *db, tk_sqlite_stmt *s) {
@@ -383,7 +384,9 @@ static int tk_ca_filter (sqlite3_vtab_cursor *cur, int idxNum,
     }
     int ai = 1;
     if ((idxNum & 2) && ai < argc) {
-      c->cnt = sqlite3_value_int(argv[ai]);
+      int n = sqlite3_value_int(argv[ai]);
+      if (n < 0) n = 0;
+      if (n < c->cnt) c->cnt = n;
       ai++;
     }
     if ((idxNum & 4) && ai < argc) {
@@ -469,9 +472,9 @@ static int stmt_bind_carray (lua_State *L) {
     return luaL_error(L, "bind_carray: expected ivec, svec, fvec, or dvec");
   int start = (int) luaL_optinteger(L, 4, 0);
   int count = (int) luaL_optinteger(L, 5, cnt - start);
-  if (start < 0 || count < 0 || start + count > cnt)
-    return luaL_error(L, "bind_carray: slice [%d,%d) out of range for length %d",
-      start, start + count, cnt);
+  if (start < 0 || count < 0 || start > cnt || count > cnt - start)
+    return luaL_error(L, "bind_carray: slice [%d,+%d) out of range for length %d",
+      start, count, cnt);
   size_t esz;
   switch (type) {
     case TK_CA_INT64:  esz = sizeof(int64_t); break;
@@ -480,6 +483,7 @@ static int stmt_bind_carray (lua_State *L) {
     default:           esz = sizeof(int32_t); break;
   }
   tk_ca_bind *b = malloc(sizeof(*b));
+  if (!b) return luaL_error(L, "bind_carray: out of memory");
   b->ptr = (char *) data + (size_t) start * esz;
   b->cnt = count;
   b->type = type;
