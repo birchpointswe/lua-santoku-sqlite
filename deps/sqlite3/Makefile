@@ -1,11 +1,4 @@
-EMMAKE :=
-ifneq (,$(findstring emcc,$(CC)))
-EMMAKE := emmake
-endif
-
 SQLITE_VERSION := 3490200
-SQLITE_YEAR := 2025
-SQLITE_URL := https://www.sqlite.org/$(SQLITE_YEAR)/sqlite-amalgamation-$(SQLITE_VERSION).zip
 SQLITE_DIR := sqlite-amalgamation-$(SQLITE_VERSION)
 
 # Kept: json, subqueries, CTEs, cast, like/glob, collate, datetime, compound
@@ -47,9 +40,7 @@ SQLITE_CFLAGS := \
   -DSQLITE_MAX_EXPR_DEPTH=0
 
 results.mk:
-	if ! [ -f sqlite-amalgamation-$(SQLITE_VERSION).zip ]; then \
-	  wget $(SQLITE_URL); \
-	fi
+	[ -f sqlite-amalgamation-$(SQLITE_VERSION).zip ] || { echo "missing vendored sqlite-amalgamation-$(SQLITE_VERSION).zip; run 'toku vendor'" >&2; exit 1; }
 	if [ -d $(SQLITE_DIR) ]; then rm -rf $(SQLITE_DIR); fi
 	unzip sqlite-amalgamation-$(SQLITE_VERSION).zip
 	cd $(SQLITE_DIR) && $(CC) -c $(SQLITE_CFLAGS) $(CFLAGS) -o sqlite3.o sqlite3.c

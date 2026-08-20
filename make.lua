@@ -1,9 +1,16 @@
 local env = {
   name = "santoku-sqlite",
-  version = "2.0.1-1",
+  version = "2.1.0-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,
+  vendor = {
+    {
+      file = "deps/sqlite3/sqlite-amalgamation-3490200.zip",
+      url = "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip",
+      sha256 = "921fc725517a694df7df38a2a3dfede6684024b5788d9de464187c612afb5918",
+    },
+  },
   cflags = {
     "-I$(PWD)/deps/sqlite3/",
     "-I$(shell luarocks show santoku-monocypher --rock-dir)/include/",
