@@ -1228,6 +1228,12 @@ int luaopen_santoku_sqlite_db (lua_State *L) {
   lua_setfield(L, -2, "key_clear");
   lua_pushcfunction(L, tk_enc_vfs_name);
   lua_setfield(L, -2, "enc_vfs");
+#ifdef __EMSCRIPTEN__
+  lua_pushboolean(L, 1);
+#else
+  lua_pushboolean(L, 0);
+#endif
+  lua_setfield(L, -2, "wasm");
   lua_pushinteger(L, SQLITE_OK);
   lua_setfield(L, -2, "OK");
   lua_pushinteger(L, SQLITE_ERROR);

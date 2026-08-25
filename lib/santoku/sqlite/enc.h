@@ -1,45 +1,6 @@
 #ifndef TK_SQLITE_ENC_H
 #define TK_SQLITE_ENC_H
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include <sqlite3.h>
 
 #include <stdint.h>
@@ -67,10 +28,6 @@
 #define TK_ENC_MAX_VFS      8
 #define TK_ENC_NAME_MAX     80
 
-
-
-
-
 #ifdef __EMSCRIPTEN__
 EM_JS(void, tk_enc_js_random, (unsigned char *buf, int n), {
   var a = new Uint8Array(n);
@@ -87,8 +44,6 @@ static void tk_enc_random (void *buf, size_t n)
   arc4random_buf(buf, n);
 #endif
 }
-
-
 
 static void tk_enc_put32 (unsigned char *p, uint32_t v)
 {
@@ -118,14 +73,6 @@ static uint64_t tk_enc_get64 (const unsigned char *p)
   return v;
 }
 
-
-
-
-
-
-
-
-
 typedef struct tk_enc_key_s {
   struct tk_enc_key_s *next;
   char *path;
@@ -133,19 +80,12 @@ typedef struct tk_enc_key_s {
   int refs;
 } tk_enc_key_t;
 
-
-
-
-
 static tk_enc_key_t *tk_enc_keys = NULL;
 
 static int tk_enc_key_register (const char *path, const unsigned char *key)
 {
   for (tk_enc_key_t *e = tk_enc_keys; e; e = e->next) {
     if (!strcmp(e->path, path)) {
-
-
-
 
       if (memcmp(e->key, key, TK_ENC_KEYLEN))
         return SQLITE_MISUSE;
@@ -199,8 +139,6 @@ static int tk_enc_key_find (const char *path, unsigned char *out)
   return 0;
 }
 
-
-
 typedef struct {
   sqlite3_file base;
   sqlite3_file *p;
@@ -209,6 +147,7 @@ typedef struct {
   uint32_t block;
   sqlite3_int64 lsize;
   int hashdr;
+  int softfail;
 } tk_enc_file;
 
 static sqlite3_int64 tk_enc_frame_off (tk_enc_file *f, uint64_t idx)
@@ -238,8 +177,30 @@ static int tk_enc_hdr_flush (tk_enc_file *f)
   return rc;
 }
 
-
-
+static int tk_enc_hdr_refresh (tk_enc_file *f)
+{
+  sqlite3_int64 psz = 0;
+  int rc = f->p->pMethods->xFileSize(f->p, &psz);
+  if (rc != SQLITE_OK)
+    return rc;
+  if (psz < TK_ENC_HDR)
+    return SQLITE_OK;
+  unsigned char h[TK_ENC_HDR];
+  rc = f->p->pMethods->xRead(f->p, h, TK_ENC_HDR, 0);
+  if (rc != SQLITE_OK)
+    return rc;
+  if (memcmp(h, TK_ENC_MAGIC, TK_ENC_MAGIC_LEN) ||
+      tk_enc_get32(h + 8) != TK_ENC_VERSION)
+    return SQLITE_NOTADB;
+  uint32_t blk = tk_enc_get32(h + 12);
+  if (blk < 512 || blk > 65536 || (blk & (blk - 1)))
+    return SQLITE_NOTADB;
+  f->block = blk;
+  f->lsize = (sqlite3_int64) tk_enc_get64(h + 16);
+  memcpy(f->salt, h + 24, TK_ENC_SALT);
+  f->hashdr = 1;
+  return SQLITE_OK;
+}
 
 static int tk_enc_block_read (tk_enc_file *f, uint64_t idx, unsigned char *out)
 {
@@ -268,9 +229,13 @@ static int tk_enc_block_read (tk_enc_file *f, uint64_t idx, unsigned char *out)
     ad, TK_ENC_AAD, frame + TK_ENC_NONCE, f->block);
   sqlite3_free(frame);
 
-
-  if (bad)
+  if (bad) {
+    if (f->softfail) {
+      memset(out, 0, f->block);
+      return SQLITE_OK;
+    }
     return SQLITE_IOERR_READ;
+  }
   return SQLITE_OK;
 }
 
@@ -304,6 +269,11 @@ static int tk_enc_io_read (sqlite3_file *pf, void *buf, int amt, sqlite3_int64 o
 {
   tk_enc_file *f = (tk_enc_file *) pf;
   unsigned char *dst = (unsigned char *) buf;
+  if (!f->hashdr || off + amt > f->lsize) {
+    int rc0 = tk_enc_hdr_refresh(f);
+    if (rc0 != SQLITE_OK)
+      return rc0;
+  }
   if (!f->hashdr || off >= f->lsize) {
     memset(dst, 0, (size_t) amt);
     return SQLITE_IOERR_SHORT_READ;
@@ -348,7 +318,9 @@ static int tk_enc_io_read (sqlite3_file *pf, void *buf, int amt, sqlite3_int64 o
 static int tk_enc_io_write (sqlite3_file *pf, const void *buf, int amt, sqlite3_int64 off)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
-  int rc = SQLITE_OK;
+  int rc = tk_enc_hdr_refresh(f);
+  if (rc != SQLITE_OK)
+    return rc;
   if (!f->hashdr) {
     rc = tk_enc_hdr_flush(f);
     if (rc != SQLITE_OK)
@@ -357,9 +329,6 @@ static int tk_enc_io_write (sqlite3_file *pf, const void *buf, int amt, sqlite3_
   unsigned char *blk = (unsigned char *) sqlite3_malloc((int) f->block);
   if (!blk)
     return SQLITE_NOMEM;
-
-
-
 
   if (off > f->lsize) {
     sqlite3_int64 psz = 0;
@@ -420,9 +389,14 @@ static int tk_enc_io_write (sqlite3_file *pf, const void *buf, int amt, sqlite3_
 static int tk_enc_io_truncate (sqlite3_file *pf, sqlite3_int64 size)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
+  int rc = SQLITE_OK;
+  if (!f->hashdr) {
+    rc = tk_enc_hdr_refresh(f);
+    if (rc != SQLITE_OK)
+      return rc;
+  }
   if (!f->hashdr && size == 0)
     return SQLITE_OK;
-  int rc = SQLITE_OK;
   if (!f->hashdr) {
     rc = tk_enc_hdr_flush(f);
     if (rc != SQLITE_OK)
@@ -446,52 +420,17 @@ static int tk_enc_io_sync (sqlite3_file *pf, int flags)
 static int tk_enc_io_filesize (sqlite3_file *pf, sqlite3_int64 *pSize)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
+  int rc = tk_enc_hdr_refresh(f);
+  if (rc != SQLITE_OK)
+    return rc;
   *pSize = f->hashdr ? f->lsize : 0;
-  return SQLITE_OK;
-}
-
-
-
-
-
-
-static int tk_enc_hdr_refresh (tk_enc_file *f)
-{
-  if (!f->hashdr)
-    return SQLITE_OK;
-  sqlite3_int64 psz = 0;
-  int rc = f->p->pMethods->xFileSize(f->p, &psz);
-  if (rc != SQLITE_OK)
-    return rc;
-  if (psz < TK_ENC_HDR)
-    return SQLITE_OK;
-  unsigned char h[TK_ENC_HDR];
-  rc = f->p->pMethods->xRead(f->p, h, TK_ENC_HDR, 0);
-  if (rc != SQLITE_OK)
-    return rc;
-  if (memcmp(h, TK_ENC_MAGIC, TK_ENC_MAGIC_LEN) ||
-      tk_enc_get32(h + 8) != TK_ENC_VERSION)
-    return SQLITE_NOTADB;
-  uint32_t blk = tk_enc_get32(h + 12);
-  if (blk < 512 || blk > (1 << 20))
-    return SQLITE_NOTADB;
-  f->block = blk;
-  f->lsize = (sqlite3_int64) tk_enc_get64(h + 16);
-  memcpy(f->salt, h + 24, TK_ENC_SALT);
   return SQLITE_OK;
 }
 
 static int tk_enc_io_lock (sqlite3_file *pf, int l)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
-  int rc = f->p->pMethods->xLock(f->p, l);
-  if (rc != SQLITE_OK)
-    return rc;
-
-
-  if (l > SQLITE_LOCK_NONE)
-    return tk_enc_hdr_refresh(f);
-  return SQLITE_OK;
+  return f->p->pMethods->xLock(f->p, l);
 }
 
 static int tk_enc_io_unlock (sqlite3_file *pf, int l)
@@ -527,7 +466,7 @@ static int tk_enc_io_file_control (sqlite3_file *pf, int op, void *arg)
 static int tk_enc_io_sector_size (sqlite3_file *pf)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
-  return f->p->pMethods->xSectorSize(f->p);
+  return (int) f->block;
 }
 
 static int tk_enc_io_device_char (sqlite3_file *pf)
@@ -535,11 +474,38 @@ static int tk_enc_io_device_char (sqlite3_file *pf)
   tk_enc_file *f = (tk_enc_file *) pf;
   int d = f->p->pMethods->xDeviceCharacteristics(f->p);
 
-
   d &= ~(SQLITE_IOCAP_ATOMIC | SQLITE_IOCAP_ATOMIC512 | SQLITE_IOCAP_ATOMIC1K |
          SQLITE_IOCAP_ATOMIC2K | SQLITE_IOCAP_ATOMIC4K | SQLITE_IOCAP_ATOMIC8K |
-         SQLITE_IOCAP_ATOMIC16K | SQLITE_IOCAP_ATOMIC32K | SQLITE_IOCAP_ATOMIC64K);
+         SQLITE_IOCAP_ATOMIC16K | SQLITE_IOCAP_ATOMIC32K | SQLITE_IOCAP_ATOMIC64K |
+         SQLITE_IOCAP_SAFE_APPEND | SQLITE_IOCAP_POWERSAFE_OVERWRITE);
+#ifdef SQLITE_IOCAP_BATCH_ATOMIC
+  d &= ~SQLITE_IOCAP_BATCH_ATOMIC;
+#endif
   return d;
+}
+
+static int tk_enc_io_shm_map (sqlite3_file *pf, int ipg, int pgsz, int ext, void volatile **pp)
+{
+  tk_enc_file *f = (tk_enc_file *) pf;
+  return f->p->pMethods->xShmMap(f->p, ipg, pgsz, ext, pp);
+}
+
+static int tk_enc_io_shm_lock (sqlite3_file *pf, int ofst, int n, int flags)
+{
+  tk_enc_file *f = (tk_enc_file *) pf;
+  return f->p->pMethods->xShmLock(f->p, ofst, n, flags);
+}
+
+static void tk_enc_io_shm_barrier (sqlite3_file *pf)
+{
+  tk_enc_file *f = (tk_enc_file *) pf;
+  f->p->pMethods->xShmBarrier(f->p);
+}
+
+static int tk_enc_io_shm_unmap (sqlite3_file *pf, int del)
+{
+  tk_enc_file *f = (tk_enc_file *) pf;
+  return f->p->pMethods->xShmUnmap(f->p, del);
 }
 
 static const sqlite3_io_methods tk_enc_io = {
@@ -559,7 +525,26 @@ static const sqlite3_io_methods tk_enc_io = {
   NULL, NULL, NULL, NULL, NULL, NULL
 };
 
-
+static const sqlite3_io_methods tk_enc_io_v2 = {
+  2,
+  tk_enc_io_close,
+  tk_enc_io_read,
+  tk_enc_io_write,
+  tk_enc_io_truncate,
+  tk_enc_io_sync,
+  tk_enc_io_filesize,
+  tk_enc_io_lock,
+  tk_enc_io_unlock,
+  tk_enc_io_check_reserved,
+  tk_enc_io_file_control,
+  tk_enc_io_sector_size,
+  tk_enc_io_device_char,
+  tk_enc_io_shm_map,
+  tk_enc_io_shm_lock,
+  tk_enc_io_shm_barrier,
+  tk_enc_io_shm_unmap,
+  NULL, NULL
+};
 
 typedef struct {
   sqlite3_vfs base;
@@ -579,8 +564,6 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
   f->base.pMethods = NULL;
   f->p = (sqlite3_file *) ((char *) f + sizeof(tk_enc_file));
 
-
-
   const char *dbf = zName;
   int derived = SQLITE_OPEN_MAIN_JOURNAL;
 #ifdef SQLITE_OPEN_SUPER_JOURNAL
@@ -595,12 +578,21 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
       dbf = d;
   }
 
+  int softf = SQLITE_OPEN_MAIN_JOURNAL;
+#ifdef SQLITE_OPEN_WAL
+  softf |= SQLITE_OPEN_WAL;
+#endif
+  f->softfail = (flags & softf) != 0;
+
+  int keyed = SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_MAIN_JOURNAL;
+#ifdef SQLITE_OPEN_WAL
+  keyed |= SQLITE_OPEN_WAL;
+#endif
   int havekey = dbf ? tk_enc_key_find(dbf, f->key) : 0;
   if (!havekey) {
-    if (flags & SQLITE_OPEN_MAIN_DB)
+    if (flags & keyed)
 
       return SQLITE_CANTOPEN;
-
 
     tk_enc_random(f->key, TK_ENC_KEYLEN);
   }
@@ -635,7 +627,7 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
       return SQLITE_NOTADB;
     }
     f->block = tk_enc_get32(h + 12);
-    if (f->block < 512 || f->block > (1 << 20)) {
+    if (f->block < 512 || f->block > 65536 || (f->block & (f->block - 1))) {
       f->p->pMethods->xClose(f->p);
       crypto_wipe(f->key, TK_ENC_KEYLEN);
       return SQLITE_NOTADB;
@@ -645,7 +637,9 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
     f->hashdr = 1;
   }
 
-  f->base.pMethods = &tk_enc_io;
+  f->base.pMethods =
+    (f->p->pMethods->iVersion >= 2 && f->p->pMethods->xShmMap)
+      ? &tk_enc_io_v2 : &tk_enc_io;
   return SQLITE_OK;
 }
 
@@ -692,8 +686,6 @@ static int tk_enc_vfs_getlasterror (sqlite3_vfs *pVfs, int n, char *z)
     return par->xGetLastError(par, n, z);
   return SQLITE_OK;
 }
-
-
 
 static const char *tk_enc_vfs_ensure (const char *parent_name)
 {

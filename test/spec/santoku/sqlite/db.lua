@@ -182,9 +182,8 @@ test("propagates sql errors", function ()
 end)
 
 test("persists to a file across open and close", function ()
-  local dir = os.getenv("PREFIX")
-  local path = (dir and (dir .. "/tmp") or "/tmp") ..
-    "/tk_sqlite_test_" .. tostring(os.time()) .. "_" .. tostring(math.random(1, 1000000)) .. ".db"
+  local path = "tk_sqlite_test_" ..
+    tostring(os.time()) .. "_" .. tostring(math.random(1, 1000000)) .. ".db"
   os.remove(path)
   local d1 = sql(sqlite.open(path))
   d1.exec("create table t (n)")

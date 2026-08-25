@@ -83,7 +83,9 @@ Anchor test: `test/spec/santoku/sqlite.lua`.
 ## Encrypted databases
 
 `sqlite.open_encrypted(path, key, [parent_vfs])` opens a database whose every
-byte on disk is encrypted — pages, rollback journal and transient files alike.
+byte on disk is encrypted — pages, rollback journal, WAL and transient files
+alike (the sole exception is WAL mode's `-shm` wal-index, which is shared
+memory holding page numbers and counters, never content).
 `key` must be exactly 32 raw bytes (`santoku-monocypher`'s `key:bytes()` /
 `key:derive(label):bytes()` produce one). `parent_vfs` names the VFS to sit on
 top of, defaulting to the platform default; pass `"opfs-coop"` in the browser.
@@ -144,14 +146,28 @@ attached schema so it can participate in these cross-database queries.
 
 Notes and limits:
 
-- WAL is not available through the shim (its io-methods are iVersion 1); keep
-  the database in a rollback journal mode.
+- WAL works whenever the parent VFS supports shared memory (the unix default
+  does; `opfs-coop` does not, so browser builds stay in rollback mode). The
+  `-shm` wal-index is raw shared memory and cannot be encrypted; it leaks page
+  numbers and frame counts, never content. WAL appends are misaligned with the
+  container frames, so each append costs a read-modify-write of two frames plus
+  a header flush.
+- A `-journal` or `-wal` frame that fails authentication reads as zeros, so
+  SQLite's own checksums truncate a torn tail after a crash instead of the open
+  failing outright. Tampering with those files is equivalent to deleting them,
+  which no scheme prevents; the main database still hard-fails on a tampered
+  frame.
+- The shim reports its block size as the sector size and clears
+  `POWERSAFE_OVERWRITE`, since a torn frame write can destroy a whole block, not
+  just the bytes logically written.
 - `SQLITE_MAX_ATTACHED` is the stock 10, so at most ten databases at once.
 - Reopening a path that is still open with a *different* key is refused
   (`"database already open with a different key"`) rather than silently reusing
   the registered one.
 - The key is released when the connection closes; call `close_vm()` first so
-  `close()` is not blocked by cached statements.
+  `close()` is not blocked by cached statements. Clearing a path's last
+  registration while a connection is still open makes its next journal or WAL
+  open fail loudly rather than proceed unrecoverably.
 - Requires `santoku-monocypher` (its crypto core is header-only), so the project
   keeps a single crypto implementation.
 

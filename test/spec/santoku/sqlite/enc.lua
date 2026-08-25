@@ -9,6 +9,8 @@ local sql = require("santoku.sqlite")
 local KEY_A = string.rep("A", 32)
 local KEY_B = string.rep("B", 32)
 
+local WAL_OK = not sqlite.wasm
+
 local seq = 0
 
 local function tmpname (n)
@@ -19,6 +21,8 @@ end
 local function rm (p)
   os.remove(p)
   os.remove(p .. "-journal")
+  os.remove(p .. "-wal")
+  os.remove(p .. "-shm")
 end
 
 local function slurp (p)
@@ -217,13 +221,11 @@ test("key_set enables ATTACH of a differently-keyed database", function ()
   seed(sql(rb), 4)
   rb:close_vm() rb:close()
 
-
   local r = sqlite.open_encrypted(pa, KEY_A)
   local d = sql(r)
   local ok = pcall(function () return d.exec("attach database '" .. pb .. "' as b") end)
   assert(ok == false, "attach without a registered key must fail")
   r:close_vm() r:close()
-
 
   assert(sqlite.key_set(pb, KEY_B) == true)
   local r2 = sqlite.open_encrypted(pa, KEY_A)
@@ -251,8 +253,6 @@ end)
 
 test("attached databases inherit the connection's VFS", function ()
 
-
-
   local pe, pp = tmpname("vfse"), tmpname("vfsp")
   rm(pe) rm(pp)
   local re = sqlite.open_encrypted(pe, KEY_A)
@@ -273,8 +273,6 @@ test("attached databases inherit the connection's VFS", function ()
 end)
 
 test("merged read connection: in-memory main with encrypted attaches", function ()
-
-
 
   local pa, pb = tmpname("mga"), tmpname("mgb")
   rm(pa) rm(pb)
@@ -310,7 +308,6 @@ test("merged read connection: in-memory main with encrypted attaches", function 
   rm(pa) rm(pb)
 end)
 
-
 local HDR, BLOCK, OVH = 64, 4096, 40
 local FRAME = BLOCK + OVH
 
@@ -326,7 +323,6 @@ local function frame_nonce (blob, i)
 end
 
 test("every write of a block draws a fresh nonce", function ()
-
 
   local p = tmpname("nonce")
   rm(p)
@@ -479,9 +475,6 @@ end)
 
 test("a second connection sees writes made by the first", function ()
 
-
-
-
   local p = tmpname("twoconn")
   rm(p)
   local ra = sqlite.open_encrypted(p, KEY_A)
@@ -492,7 +485,6 @@ test("a second connection sees writes made by the first", function ()
   local rb = sqlite.open_encrypted(p, KEY_A)
   local dbb = sql(rb)
   assert(dbb.getter("select count(*) as n from notes", "n")() == 10)
-
 
   local ins = da.runner("insert into notes (id, body) values (?1, ?2)")
   for i = 11, 800 do
@@ -509,9 +501,6 @@ test("a second connection sees writes made by the first", function ()
 end)
 
 test("the -journal file itself is encrypted mid-transaction", function ()
-
-
-
 
   local p = tmpname("jrnl")
   rm(p)
@@ -548,16 +537,6 @@ end)
 
 test("a hot journal is decrypted and rolled back on a cold open", function ()
 
-
-
-
-
-
-
-
-
-
-
   local p, pj, pn = tmpname("hotj"), tmpname("hotj-withj"), tmpname("hotj-noj")
   rm(p) rm(pj) rm(pn)
   local pad = string.rep("z", 600)
@@ -586,7 +565,6 @@ test("a hot journal is decrypted and rolled back on a cold open", function ()
   r2:close_vm() r2:close()
   assert(snap_j ~= nil and #snap_j > 0, "no journal present mid-transaction")
 
-
   spit(pn, snap_db)
   local rn = sqlite.open_encrypted(pn, KEY_A)
   assert(rn ~= nil)
@@ -594,8 +572,6 @@ test("a hot journal is decrypted and rolled back on a cold open", function ()
   assert(dn.getter("select body from notes where id = 7", "body")():sub(1, 8) == "DIRTY-7-",
     "main file held no uncommitted pages -- the recovery arm below would be vacuous")
   rn:close_vm() rn:close()
-
-
 
   spit(pj, snap_db)
   spit(pj .. "-journal", snap_j)
@@ -610,10 +586,107 @@ test("a hot journal is decrypted and rolled back on a cold open", function ()
   rm(p) rm(pj) rm(pn)
 end)
 
+test("clearing the key of an open database fails writes loudly", function ()
+
+  local p = tmpname("keygone")
+  rm(p)
+  local raw = sqlite.open_encrypted(p, KEY_A)
+  local db = sql(raw)
+  seed(db, 3)
+  assert(sqlite.key_clear(p) == true)
+  local ok = pcall(function ()
+    db.runner("insert into notes (id, body) values (?1, ?2)")(100, "late write")
+  end)
+  assert(ok == false, "write with a cleared key must fail, not draw a random journal key")
+  raw:close_vm() raw:close()
+  rm(p)
+end)
+
+test("wal mode round-trips and the wal file is encrypted", function ()
+  if not WAL_OK then return end
+  local p = tmpname("wal")
+  rm(p)
+  local raw = sqlite.open_encrypted(p, KEY_A)
+  local db = sql(raw)
+  db.exec("pragma journal_mode = wal")
+  assert(db.getter("pragma journal_mode", "journal_mode")() == "wal",
+    "journal_mode=wal was refused by the shim")
+  seed(db, 200)
+  local wal = slurp(p .. "-wal")
+  assert(wal ~= nil and #wal > 0, "no wal file written")
+  assert(wal:sub(1, 8) == "TKSQENC1", "wal is not in the encrypted container")
+  assert(not wal:find("quick brown fox", 1, true), "wal leaked row content")
+  assert(not wal:find("notes", 1, true), "wal leaked the schema")
+  raw:close_vm() raw:close()
+  local raw2 = sqlite.open_encrypted(p, KEY_A)
+  local db2 = sql(raw2)
+  assert(db2.getter("select count(*) as n from notes", "n")() == 200)
+  assert(db2.getter("select body from notes where id = 199", "body")()
+    == "the quick brown fox jumps over the lazy dog 199")
+  raw2:close_vm() raw2:close()
+  rm(p)
+end)
+
+test("wal: a second connection reads while the first writes", function ()
+  if not WAL_OK then return end
+  local p = tmpname("walconc")
+  rm(p)
+  local ra = sqlite.open_encrypted(p, KEY_A)
+  local da = sql(ra)
+  da.exec("pragma journal_mode = wal")
+  seed(da, 10)
+  assert(sqlite.key_set(p, KEY_A) == true)
+  local rb = sqlite.open_encrypted(p, KEY_A)
+  local dbb = sql(rb)
+  assert(dbb.getter("select count(*) as n from notes", "n")() == 10)
+  local ins = da.runner("insert into notes (id, body) values (?1, ?2)")
+  for i = 11, 500 do
+    ins(i, "the quick brown fox jumps over the lazy dog " .. i)
+  end
+  local n = dbb.getter("select count(*) as n from notes", "n")()
+  assert(n == 500, "second connection saw " .. tostring(n) .. " rows, expected 500")
+  ra:close_vm() ra:close()
+  rb:close_vm() rb:close()
+  sqlite.key_clear(p)
+  rm(p)
+end)
+
+test("wal: a corrupted tail recovers instead of failing the open", function ()
+
+  if not WAL_OK then return end
+  local p = tmpname("waltear")
+  rm(p)
+  local raw = sqlite.open_encrypted(p, KEY_A)
+  local db = sql(raw)
+  db.exec("pragma journal_mode = wal")
+  db.exec("pragma wal_autocheckpoint = 0")
+  seed(db, 50)
+  local ins = db.runner("insert into notes (id, body) values (?1, ?2)")
+  for i = 51, 100 do
+    ins(i, "the quick brown fox jumps over the lazy dog " .. i)
+  end
+  local snap_db, snap_wal = slurp(p), slurp(p .. "-wal")
+  raw:close_vm() raw:close()
+  assert(snap_wal ~= nil and #snap_wal > HDR + 2 * FRAME, "wal was empty before the tear")
+
+  local cut = #snap_wal - math.floor(FRAME / 2)
+  local byte = snap_wal:byte(cut)
+  spit(p, snap_db or "")
+  spit(p .. "-wal",
+    snap_wal:sub(1, cut - 1) .. string.char((byte + 1) % 256) .. snap_wal:sub(cut + 1))
+  os.remove(p .. "-shm")
+  local raw2 = sqlite.open_encrypted(p, KEY_A)
+  assert(raw2 ~= nil, "torn wal tail made the database unopenable")
+  local db2 = sql(raw2)
+  local n = db2.getter("select count(*) as n from notes", "n")()
+  assert(n >= 50, "recovery lost committed pre-tear data, got " .. tostring(n))
+  assert(db2.getter("select body from notes where id = 7", "body")()
+    == "the quick brown fox jumps over the lazy dog 7")
+  raw2:close_vm() raw2:close()
+  rm(p)
+end)
+
 test("read-modify-write of an existing frame also draws a fresh nonce", function ()
-
-
-
 
   local p = tmpname("rmwnonce")
   rm(p)
