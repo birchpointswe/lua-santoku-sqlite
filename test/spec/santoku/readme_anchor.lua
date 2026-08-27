@@ -1,62 +1,3 @@
-<p align="center">
-  <img src="https://santoku.dev/logo-santoku-sqlite.png" height="64" alt="santoku-sqlite">
-</p>
-
-# santoku-sqlite
-
-SQLite for Lua, with the amalgamation vendored in. Prepared statements are exposed as
-ordinary Lua functions, transactions take a Lua function, and the package adds a
-page-level encryption layer and a trigram search index on top of the raw bindings.
-
-## Install
-
-```sh
-luarocks install santoku-sqlite
-```
-
-## Example
-
-```lua
-local sqlite = require("santoku.sqlite.db")
-local sql = require("santoku.sqlite")
-
-local db = sql(sqlite.open_memory())
-
-db.exec("create table cities (name text, state text)")
-
-local add = db.runner("insert into cities (name, state) values (?, ?)")
-local get = db.getter("select state from cities where name = ?")
-
-add("Tampa", "Florida")
-
-print(get("Tampa"))
-```
-
-`runner`, `getter`, `iter`, `all`, and `inserter` each prepare the statement once and hand
-back a function; passing `true` asks for whole rows as tables instead of single values.
-
-## Documentation
-
-Runnable examples and the full API: [santoku.dev](https://santoku.dev/#santoku-sqlite).
-
-For agents and LLM tooling: [llms.txt](https://santoku.dev/llms.txt) for the index,
-[llms-full.txt](https://santoku.dev/llms-full.txt) for every documented example.
-
-## Tests
-
-The tests are the spec. For the exhaustive surface, read them:
-[`test/spec/santoku/sqlite/db.lua`](test/spec/santoku/sqlite/db.lua),
-[`test/spec/santoku/sqlite/enc.lua`](test/spec/santoku/sqlite/enc.lua),
-[`test/spec/santoku/sqlite/search.lua`](test/spec/santoku/sqlite/search.lua), and
-[`test/spec/santoku/sqlite/carray.lua`](test/spec/santoku/sqlite/carray.lua).
-
-## License
-
-MIT, see [LICENSE](LICENSE).
-
-## More examples
-
-```lua
 local test = require("santoku.test")
 
 local err = require("santoku.error")
@@ -114,4 +55,3 @@ test("transactions take a lua function, and roll back cleanly", function ()
   assert(eq(4, count()))
   db.close()
 end)
-```
