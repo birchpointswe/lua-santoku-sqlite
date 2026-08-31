@@ -308,8 +308,9 @@ test("merged read connection: in-memory main with encrypted attaches", function 
   rm(pa) rm(pb)
 end)
 
-local HDR, BLOCK, OVH = 64, 4096, 40
+local HDR, BLOCK, OVH = 128, 4096, 40
 local FRAME = BLOCK + OVH
+local DATA0 = HDR + FRAME
 
 local function spit (p, s)
   local fh = assert(io.open(p, "wb"))
@@ -318,7 +319,7 @@ local function spit (p, s)
 end
 
 local function frame_nonce (blob, i)
-  local off = HDR + i * FRAME
+  local off = DATA0 + i * FRAME
   return blob:sub(off + 1, off + 24)
 end
 
@@ -353,7 +354,7 @@ test("a tampered frame fails the read instead of returning garbage", function ()
 
   local blob = slurp(p)
 
-  local pos = HDR + 24 + 100
+  local pos = DATA0 + 24 + 100
   local byte = blob:byte(pos + 1)
   local flipped = string.char((byte + 1) % 256)
   spit(p, blob:sub(1, pos) .. flipped .. blob:sub(pos + 2))
@@ -375,11 +376,11 @@ test("frames cannot be reordered (AAD binds the block index)", function ()
   raw:close_vm() raw:close()
 
   local blob = slurp(p)
-  assert(#blob >= HDR + 2 * FRAME, "need at least two frames")
-  local f0 = blob:sub(HDR + 1, HDR + FRAME)
-  local f1 = blob:sub(HDR + FRAME + 1, HDR + 2 * FRAME)
+  assert(#blob >= DATA0 + 2 * FRAME, "need at least two frames")
+  local f0 = blob:sub(DATA0 + 1, DATA0 + FRAME)
+  local f1 = blob:sub(DATA0 + FRAME + 1, DATA0 + 2 * FRAME)
 
-  spit(p, blob:sub(1, HDR) .. f1 .. f0 .. blob:sub(HDR + 2 * FRAME + 1))
+  spit(p, blob:sub(1, DATA0) .. f1 .. f0 .. blob:sub(DATA0 + 2 * FRAME + 1))
 
   local ok = pcall(function ()
     local r = sqlite.open_encrypted(p, KEY_A)
@@ -402,10 +403,10 @@ test("frames cannot be transplanted between files (AAD binds the file salt)", fu
   r2:close_vm() r2:close()
 
   local b1, b2 = slurp(p1), slurp(p2)
-  assert(#b1 >= HDR + 2 * FRAME and #b2 >= HDR + 2 * FRAME)
+  assert(#b1 >= DATA0 + 2 * FRAME and #b2 >= DATA0 + 2 * FRAME)
 
-  local graft = b1:sub(HDR + FRAME + 1, HDR + 2 * FRAME)
-  spit(p2, b2:sub(1, HDR + FRAME) .. graft .. b2:sub(HDR + 2 * FRAME + 1))
+  local graft = b1:sub(DATA0 + FRAME + 1, DATA0 + 2 * FRAME)
+  spit(p2, b2:sub(1, DATA0 + FRAME) .. graft .. b2:sub(DATA0 + 2 * FRAME + 1))
 
   local ok = pcall(function ()
     local r = sqlite.open_encrypted(p2, KEY_A)
@@ -566,12 +567,13 @@ test("a hot journal is decrypted and rolled back on a cold open", function ()
   assert(snap_j ~= nil and #snap_j > 0, "no journal present mid-transaction")
 
   spit(pn, snap_db)
-  local rn = sqlite.open_encrypted(pn, KEY_A)
-  assert(rn ~= nil)
-  local dn = sql(rn)
-  assert(dn.getter("select body from notes where id = 7", "body")():sub(1, 8) == "DIRTY-7-",
-    "main file held no uncommitted pages -- the recovery arm below would be vacuous")
-  rn:close_vm() rn:close()
+  local okn = pcall(function ()
+    local rn = sqlite.open_encrypted(pn, KEY_A)
+    if rn == nil then error("open failed") end
+    return sql(rn).getter("select body from notes where id = 7", "body")()
+  end)
+  assert(okn == false,
+    "a mid-transaction snapshot without its journal must not expose uncommitted pages")
 
   spit(pj, snap_db)
   spit(pj .. "-journal", snap_j)
@@ -708,5 +710,77 @@ test("read-modify-write of an existing frame also draws a fresh nonce", function
     assert(not seen[n], "frame 0 nonce repeated across a read-modify-write")
     seen[n] = true
   end
+  rm(p)
+end)
+
+local function snapshots_around_update (name)
+  local p = tmpname(name)
+  rm(p)
+  local raw = sqlite.open_encrypted(p, KEY_A)
+  seed(sql(raw), 20)
+  raw:close_vm() raw:close()
+  local before = slurp(p)
+  local r2 = sqlite.open_encrypted(p, KEY_A)
+  sql(r2).runner("update notes set body = ?2 where id = ?1")(1, "edited after snapshot")
+  r2:close_vm() r2:close()
+  local after = slurp(p)
+  assert(#before >= DATA0 + FRAME and #after >= DATA0 + FRAME)
+  return p, before, after
+end
+
+test("an earlier frame cannot be spliced back in (write counter in the AAD)", function ()
+  local p, before, after = snapshots_around_update("rollpage")
+  local old0 = before:sub(DATA0 + 1, DATA0 + FRAME)
+  spit(p, after:sub(1, DATA0) .. old0 .. after:sub(DATA0 + FRAME + 1))
+  local ok = pcall(function ()
+    local r = sqlite.open_encrypted(p, KEY_A)
+    if r == nil then error("open failed") end
+    return sql(r).getter("select count(*) as n from notes", "n")()
+  end)
+  assert(ok == false, "a rolled-back page ciphertext must not be readable")
+  rm(p)
+end)
+
+test("splicing the counter frame along with the page fails the root check", function ()
+  local p, before, after = snapshots_around_update("rollctr")
+  local oldc = before:sub(HDR + 1, HDR + FRAME)
+  local old0 = before:sub(DATA0 + 1, DATA0 + FRAME)
+  spit(p, after:sub(1, HDR) .. oldc .. old0 .. after:sub(DATA0 + FRAME + 1))
+  local ok = pcall(function ()
+    local r = sqlite.open_encrypted(p, KEY_A)
+    if r == nil then error("open failed") end
+    return sql(r).getter("select count(*) as n from notes", "n")()
+  end)
+  assert(ok == false, "a rolled-back counter frame must not verify against the root")
+  rm(p)
+end)
+
+test("whole-file rollback to a consistent snapshot still opens (documented residual)", function ()
+  local p, before = snapshots_around_update("rollfull")
+  spit(p, before)
+  local r = sqlite.open_encrypted(p, KEY_A)
+  assert(r ~= nil)
+  local db = sql(r)
+  assert(db.getter("select count(*) as n from notes", "n")() == 20)
+  assert(db.getter("select body from notes where id = 1", "body")()
+    == "the quick brown fox jumps over the lazy dog 1")
+  r:close_vm() r:close()
+  rm(p)
+end)
+
+test("a version-1 container is rejected", function ()
+  local p = tmpname("v1rej")
+  rm(p)
+  local raw = sqlite.open_encrypted(p, KEY_A)
+  seed(sql(raw), 5)
+  raw:close_vm() raw:close()
+  local blob = slurp(p)
+  spit(p, blob:sub(1, 8) .. string.char(1) .. blob:sub(10))
+  local ok = pcall(function ()
+    local r = sqlite.open_encrypted(p, KEY_A)
+    if r == nil then error("open failed") end
+    return sql(r).getter("select count(*) as n from notes", "n")()
+  end)
+  assert(ok == false, "a v1-version header must not open")
   rm(p)
 end)

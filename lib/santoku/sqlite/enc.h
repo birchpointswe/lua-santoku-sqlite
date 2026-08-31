@@ -16,17 +16,21 @@
 
 #define TK_ENC_MAGIC        "TKSQENC1"
 #define TK_ENC_MAGIC_LEN    8
-#define TK_ENC_VERSION      1
-#define TK_ENC_HDR          64
+#define TK_ENC_VERSION      2
+#define TK_ENC_HDR          128
 #define TK_ENC_NONCE        24
 #define TK_ENC_TAG          16
 #define TK_ENC_OVH          (TK_ENC_NONCE + TK_ENC_TAG)
 #define TK_ENC_SALT         16
 #define TK_ENC_AAD          (TK_ENC_SALT + 8)
+#define TK_ENC_AAD_CTR      (TK_ENC_SALT + 16)
+#define TK_ENC_ROOT         16
 #define TK_ENC_KEYLEN       32
 #define TK_ENC_BLOCK        4096
 #define TK_ENC_MAX_VFS      8
 #define TK_ENC_NAME_MAX     80
+#define TK_ENC_CTR_MARK     UINT64_MAX
+#define TK_ENC_DIRTY_BIT    (UINT64_C(1) << 63)
 
 #ifdef __EMSCRIPTEN__
 EM_JS(void, tk_enc_js_random, (unsigned char *buf, int n), {
@@ -148,18 +152,136 @@ typedef struct {
   sqlite3_int64 lsize;
   int hashdr;
   int softfail;
+  int counters;
+  int hdr_dirty;
+  int have_dirty;
+  uint64_t epoch;
+  unsigned char root[TK_ENC_ROOT];
+  uint64_t ngroups;
+  uint64_t nflushed;
+  uint64_t cgroups;
+  uint64_t *ctrs;
+  unsigned char *ctags;
+  unsigned char *cdirty;
 } tk_enc_file;
+
+static uint64_t tk_enc_k (tk_enc_file *f)
+{
+  return (uint64_t) (f->block / 8);
+}
+
+static sqlite3_int64 tk_enc_group_span (tk_enc_file *f)
+{
+  return (sqlite3_int64) (tk_enc_k(f) + 1) * (sqlite3_int64) (f->block + TK_ENC_OVH);
+}
+
+static sqlite3_int64 tk_enc_cframe_off (tk_enc_file *f, uint64_t g)
+{
+  return (sqlite3_int64) TK_ENC_HDR + (sqlite3_int64) g * tk_enc_group_span(f);
+}
 
 static sqlite3_int64 tk_enc_frame_off (tk_enc_file *f, uint64_t idx)
 {
-  return (sqlite3_int64) TK_ENC_HDR +
-         (sqlite3_int64) idx * (sqlite3_int64) (f->block + TK_ENC_OVH);
+  if (!f->counters)
+    return (sqlite3_int64) TK_ENC_HDR +
+           (sqlite3_int64) idx * (sqlite3_int64) (f->block + TK_ENC_OVH);
+  uint64_t k = tk_enc_k(f);
+  return tk_enc_cframe_off(f, idx / k) +
+         (sqlite3_int64) (1 + idx % k) * (sqlite3_int64) (f->block + TK_ENC_OVH);
 }
 
-static void tk_enc_aad (tk_enc_file *f, uint64_t idx, unsigned char *out)
+static sqlite3_int64 tk_enc_phys (tk_enc_file *f, sqlite3_int64 nblocks)
+{
+  sqlite3_int64 fsz = (sqlite3_int64) (f->block + TK_ENC_OVH);
+  if (!f->counters)
+    return (sqlite3_int64) TK_ENC_HDR + nblocks * fsz;
+  if (nblocks <= 0)
+    return TK_ENC_HDR;
+  sqlite3_int64 k = (sqlite3_int64) tk_enc_k(f);
+  sqlite3_int64 g = (nblocks - 1) / k;
+  sqlite3_int64 r = nblocks - g * k;
+  return (sqlite3_int64) TK_ENC_HDR + g * tk_enc_group_span(f) + (1 + r) * fsz;
+}
+
+static uint64_t tk_enc_have_blocks (tk_enc_file *f, sqlite3_int64 psz)
+{
+  if (psz <= TK_ENC_HDR)
+    return 0;
+  sqlite3_int64 usable = psz - TK_ENC_HDR;
+  sqlite3_int64 fsz = (sqlite3_int64) (f->block + TK_ENC_OVH);
+  if (!f->counters)
+    return (uint64_t) (usable / fsz);
+  uint64_t k = tk_enc_k(f);
+  sqlite3_int64 span = tk_enc_group_span(f);
+  uint64_t full = (uint64_t) (usable / span);
+  sqlite3_int64 rem = usable % span;
+  uint64_t part = rem > fsz ? (uint64_t) ((rem - fsz) / fsz) : 0;
+  if (part > k)
+    part = k;
+  return full * k + part;
+}
+
+static int tk_enc_aad (tk_enc_file *f, uint64_t idx, unsigned char *out)
 {
   memcpy(out, f->salt, TK_ENC_SALT);
   tk_enc_put64(out + TK_ENC_SALT, idx);
+  if (!f->counters)
+    return TK_ENC_AAD;
+  uint64_t ctr = idx < f->ngroups * tk_enc_k(f) ? f->ctrs[idx] : 0;
+  tk_enc_put64(out + TK_ENC_SALT + 8, ctr);
+  return TK_ENC_AAD_CTR;
+}
+
+static void tk_enc_caad (tk_enc_file *f, uint64_t g, unsigned char *out)
+{
+  memcpy(out, f->salt, TK_ENC_SALT);
+  tk_enc_put64(out + TK_ENC_SALT, TK_ENC_CTR_MARK);
+  tk_enc_put64(out + TK_ENC_SALT + 8, g);
+}
+
+static void tk_enc_root_calc (tk_enc_file *f, unsigned char *out)
+{
+  crypto_blake2b_ctx ctx;
+  crypto_blake2b_keyed_init(&ctx, TK_ENC_ROOT, f->key, TK_ENC_KEYLEN);
+  unsigned char n[16];
+  tk_enc_put64(n, f->epoch);
+  tk_enc_put64(n + 8, f->nflushed);
+  crypto_blake2b_update(&ctx, n, 16);
+  if (f->nflushed)
+    crypto_blake2b_update(&ctx, f->ctags, f->nflushed * TK_ENC_TAG);
+  crypto_blake2b_final(&ctx, out);
+}
+
+static int tk_enc_ctr_ensure (tk_enc_file *f, uint64_t g)
+{
+  if (g < f->cgroups) {
+    if (g >= f->ngroups)
+      f->ngroups = g + 1;
+    return SQLITE_OK;
+  }
+  uint64_t cap = f->cgroups ? f->cgroups : 4;
+  while (cap <= g)
+    cap *= 2;
+  uint64_t k = tk_enc_k(f);
+  uint64_t *ctrs = (uint64_t *) sqlite3_realloc64(f->ctrs, cap * k * sizeof(uint64_t));
+  if (!ctrs)
+    return SQLITE_NOMEM;
+  f->ctrs = ctrs;
+  unsigned char *ctags = (unsigned char *) sqlite3_realloc64(f->ctags, cap * TK_ENC_TAG);
+  if (!ctags)
+    return SQLITE_NOMEM;
+  f->ctags = ctags;
+  unsigned char *cdirty = (unsigned char *) sqlite3_realloc64(f->cdirty, cap);
+  if (!cdirty)
+    return SQLITE_NOMEM;
+  f->cdirty = cdirty;
+  memset(f->ctrs + f->cgroups * k, 0, (cap - f->cgroups) * k * sizeof(uint64_t));
+  memset(f->ctags + f->cgroups * TK_ENC_TAG, 0, (cap - f->cgroups) * TK_ENC_TAG);
+  memset(f->cdirty + f->cgroups, 0, cap - f->cgroups);
+  f->cgroups = cap;
+  if (g >= f->ngroups)
+    f->ngroups = g + 1;
+  return SQLITE_OK;
 }
 
 static int tk_enc_hdr_flush (tk_enc_file *f)
@@ -171,10 +293,95 @@ static int tk_enc_hdr_flush (tk_enc_file *f)
   tk_enc_put32(h + 12, f->block);
   tk_enc_put64(h + 16, (uint64_t) f->lsize);
   memcpy(h + 24, f->salt, TK_ENC_SALT);
+  tk_enc_put64(h + 40, f->epoch | (f->hdr_dirty ? TK_ENC_DIRTY_BIT : 0));
+  memcpy(h + 48, f->root, TK_ENC_ROOT);
+  tk_enc_put64(h + 64, f->nflushed);
   int rc = f->p->pMethods->xWrite(f->p, h, TK_ENC_HDR, 0);
   if (rc == SQLITE_OK)
     f->hashdr = 1;
   return rc;
+}
+
+static int tk_enc_ctr_load (tk_enc_file *f, int disk_dirty)
+{
+  sqlite3_int64 psz = 0;
+  int rc = f->p->pMethods->xFileSize(f->p, &psz);
+  if (rc != SQLITE_OK)
+    return rc;
+  sqlite3_int64 fsz = (sqlite3_int64) (f->block + TK_ENC_OVH);
+  sqlite3_int64 span = tk_enc_group_span(f);
+  uint64_t k = tk_enc_k(f);
+  uint64_t ng = psz > TK_ENC_HDR
+    ? (uint64_t) ((psz - TK_ENC_HDR + span - 1) / span)
+    : 0;
+  if (ng) {
+    rc = tk_enc_ctr_ensure(f, ng - 1);
+    if (rc != SQLITE_OK)
+      return rc;
+  }
+  f->ngroups = ng;
+  if (f->nflushed > ng) {
+    if (!disk_dirty)
+      return SQLITE_NOTADB;
+    f->nflushed = ng;
+    f->hdr_dirty = 1;
+    f->have_dirty = 1;
+  }
+  unsigned char *frame = NULL;
+  if (ng) {
+    frame = (unsigned char *) sqlite3_malloc64((sqlite3_uint64) fsz);
+    if (!frame)
+      return SQLITE_NOMEM;
+  }
+  for (uint64_t g = 0; g < ng; g ++) {
+    int bad = 0;
+    if (g >= f->nflushed) {
+      bad = 1;
+    } else {
+      sqlite3_int64 off = tk_enc_cframe_off(f, g);
+      if (off + fsz > psz) {
+        bad = 1;
+      } else {
+        rc = f->p->pMethods->xRead(f->p, frame, (int) fsz, off);
+        if (rc != SQLITE_OK) {
+          sqlite3_free(frame);
+          return rc;
+        }
+        unsigned char ad[TK_ENC_AAD_CTR];
+        tk_enc_caad(f, g, ad);
+        unsigned char *blk = frame + TK_ENC_NONCE;
+        bad = crypto_aead_unlock(blk, frame + TK_ENC_NONCE + f->block, f->key, frame,
+          ad, TK_ENC_AAD_CTR, blk, f->block) ? 1 : 0;
+        if (!bad) {
+          for (uint64_t i = 0; i < k; i ++)
+            f->ctrs[g * k + i] = tk_enc_get64(blk + i * 8);
+          memcpy(f->ctags + g * TK_ENC_TAG, frame + TK_ENC_NONCE + f->block, TK_ENC_TAG);
+          f->cdirty[g] = 0;
+        }
+      }
+      if (bad && !disk_dirty) {
+        sqlite3_free(frame);
+        return SQLITE_NOTADB;
+      }
+    }
+    if (bad) {
+      memset(f->ctrs + g * k, 0, k * sizeof(uint64_t));
+      memset(f->ctags + g * TK_ENC_TAG, 0, TK_ENC_TAG);
+      f->cdirty[g] = 1;
+      f->have_dirty = 1;
+    }
+  }
+  sqlite3_free(frame);
+  unsigned char root[TK_ENC_ROOT];
+  tk_enc_root_calc(f, root);
+  if (memcmp(root, f->root, TK_ENC_ROOT)) {
+    if (!disk_dirty)
+      return SQLITE_NOTADB;
+    memcpy(f->root, root, TK_ENC_ROOT);
+    f->hdr_dirty = 1;
+    f->have_dirty = 1;
+  }
+  return SQLITE_OK;
 }
 
 static int tk_enc_hdr_refresh (tk_enc_file *f)
@@ -198,8 +405,19 @@ static int tk_enc_hdr_refresh (tk_enc_file *f)
   f->block = blk;
   f->lsize = (sqlite3_int64) tk_enc_get64(h + 16);
   memcpy(f->salt, h + 24, TK_ENC_SALT);
+  int had = f->hashdr;
   f->hashdr = 1;
-  return SQLITE_OK;
+  if (!f->counters || f->have_dirty)
+    return SQLITE_OK;
+  uint64_t ep = tk_enc_get64(h + 40);
+  int dirty = (ep & TK_ENC_DIRTY_BIT) != 0;
+  ep &= ~TK_ENC_DIRTY_BIT;
+  if (had && ep == f->epoch && !dirty)
+    return SQLITE_OK;
+  f->epoch = ep;
+  memcpy(f->root, h + 48, TK_ENC_ROOT);
+  f->nflushed = tk_enc_get64(h + 64);
+  return tk_enc_ctr_load(f, dirty);
 }
 
 static int tk_enc_block_read (tk_enc_file *f, uint64_t idx, unsigned char *out)
@@ -222,11 +440,20 @@ static int tk_enc_block_read (tk_enc_file *f, uint64_t idx, unsigned char *out)
     sqlite3_free(frame);
     return rc;
   }
-  unsigned char ad[TK_ENC_AAD];
-  tk_enc_aad(f, idx, ad);
+  unsigned char ad[TK_ENC_AAD_CTR];
+  int adlen = tk_enc_aad(f, idx, ad);
   int bad = crypto_aead_unlock(out,
     frame + TK_ENC_NONCE + f->block, f->key, frame,
-    ad, TK_ENC_AAD, frame + TK_ENC_NONCE, f->block);
+    ad, adlen, frame + TK_ENC_NONCE, f->block);
+  if (bad && f->counters && !f->have_dirty) {
+    uint64_t ep = f->epoch;
+    if (tk_enc_hdr_refresh(f) == SQLITE_OK && f->epoch != ep) {
+      adlen = tk_enc_aad(f, idx, ad);
+      bad = crypto_aead_unlock(out,
+        frame + TK_ENC_NONCE + f->block, f->key, frame,
+        ad, adlen, frame + TK_ENC_NONCE, f->block);
+    }
+  }
   sqlite3_free(frame);
 
   if (bad) {
@@ -242,17 +469,84 @@ static int tk_enc_block_read (tk_enc_file *f, uint64_t idx, unsigned char *out)
 static int tk_enc_block_write (tk_enc_file *f, uint64_t idx, const unsigned char *in)
 {
   sqlite3_int64 need = (sqlite3_int64) (f->block + TK_ENC_OVH);
+  if (f->counters) {
+    int rc0 = tk_enc_ctr_ensure(f, idx / tk_enc_k(f));
+    if (rc0 != SQLITE_OK)
+      return rc0;
+    f->ctrs[idx] ++;
+    f->cdirty[idx / tk_enc_k(f)] = 1;
+    f->have_dirty = 1;
+  }
   unsigned char *frame = (unsigned char *) sqlite3_malloc((int) need);
   if (!frame)
     return SQLITE_NOMEM;
   tk_enc_random(frame, TK_ENC_NONCE);
-  unsigned char ad[TK_ENC_AAD];
-  tk_enc_aad(f, idx, ad);
+  unsigned char ad[TK_ENC_AAD_CTR];
+  int adlen = tk_enc_aad(f, idx, ad);
   crypto_aead_lock(frame + TK_ENC_NONCE, frame + TK_ENC_NONCE + f->block,
-    f->key, frame, ad, TK_ENC_AAD, in, f->block);
+    f->key, frame, ad, adlen, in, f->block);
   int rc = f->p->pMethods->xWrite(f->p, frame, (int) need, tk_enc_frame_off(f, idx));
   sqlite3_free(frame);
   return rc;
+}
+
+static int tk_enc_ctr_flush (tk_enc_file *f, int flags)
+{
+  if (!f->have_dirty || !f->hashdr)
+    return SQLITE_OK;
+  f->hdr_dirty = 1;
+  int rc = tk_enc_hdr_flush(f);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = f->p->pMethods->xSync(f->p, flags);
+  if (rc != SQLITE_OK)
+    return rc;
+  sqlite3_int64 fsz = (sqlite3_int64) (f->block + TK_ENC_OVH);
+  unsigned char *frame = (unsigned char *) sqlite3_malloc64((sqlite3_uint64) fsz);
+  if (!frame)
+    return SQLITE_NOMEM;
+  uint64_t k = tk_enc_k(f);
+  for (uint64_t g = 0; g < f->ngroups; g ++) {
+    if (!f->cdirty[g])
+      continue;
+    tk_enc_random(frame, TK_ENC_NONCE);
+    unsigned char *blk = frame + TK_ENC_NONCE;
+    for (uint64_t i = 0; i < k; i ++)
+      tk_enc_put64(blk + i * 8, f->ctrs[g * k + i]);
+    unsigned char ad[TK_ENC_AAD_CTR];
+    tk_enc_caad(f, g, ad);
+    crypto_aead_lock(blk, frame + TK_ENC_NONCE + f->block, f->key, frame,
+      ad, TK_ENC_AAD_CTR, blk, f->block);
+    rc = f->p->pMethods->xWrite(f->p, frame, (int) fsz, tk_enc_cframe_off(f, g));
+    if (rc != SQLITE_OK) {
+      sqlite3_free(frame);
+      return rc;
+    }
+    memcpy(f->ctags + g * TK_ENC_TAG, frame + TK_ENC_NONCE + f->block, TK_ENC_TAG);
+    f->cdirty[g] = 0;
+  }
+  sqlite3_free(frame);
+  rc = f->p->pMethods->xSync(f->p, flags);
+  if (rc != SQLITE_OK)
+    return rc;
+  f->epoch ++;
+  f->nflushed = f->ngroups;
+  tk_enc_root_calc(f, f->root);
+  f->hdr_dirty = 0;
+  f->have_dirty = 0;
+  return tk_enc_hdr_flush(f);
+}
+
+static void tk_enc_ctr_free (tk_enc_file *f)
+{
+  sqlite3_free(f->ctrs);
+  sqlite3_free(f->ctags);
+  sqlite3_free(f->cdirty);
+  f->ctrs = NULL;
+  f->ctags = NULL;
+  f->cdirty = NULL;
+  f->ngroups = 0;
+  f->cgroups = 0;
 }
 
 static int tk_enc_io_close (sqlite3_file *pf)
@@ -261,6 +555,7 @@ static int tk_enc_io_close (sqlite3_file *pf)
   int rc = SQLITE_OK;
   if (f->p->pMethods)
     rc = f->p->pMethods->xClose(f->p);
+  tk_enc_ctr_free(f);
   crypto_wipe(f->key, TK_ENC_KEYLEN);
   return rc;
 }
@@ -337,9 +632,7 @@ static int tk_enc_io_write (sqlite3_file *pf, const void *buf, int amt, sqlite3_
       sqlite3_free(blk);
       return rc;
     }
-    uint64_t have = psz > TK_ENC_HDR
-      ? (uint64_t) ((psz - TK_ENC_HDR) / (sqlite3_int64) (f->block + TK_ENC_OVH))
-      : 0;
+    uint64_t have = tk_enc_have_blocks(f, psz);
     uint64_t first = (uint64_t) (off / f->block);
     for (uint64_t i = have; i < first; i ++) {
       memset(blk, 0, f->block);
@@ -403,8 +696,33 @@ static int tk_enc_io_truncate (sqlite3_file *pf, sqlite3_int64 size)
       return rc;
   }
   sqlite3_int64 nblocks = (size + (sqlite3_int64) f->block - 1) / (sqlite3_int64) f->block;
-  rc = f->p->pMethods->xTruncate(f->p,
-    (sqlite3_int64) TK_ENC_HDR + nblocks * (sqlite3_int64) (f->block + TK_ENC_OVH));
+  if (f->counters) {
+    uint64_t k = tk_enc_k(f);
+    uint64_t ng = nblocks > 0 ? (uint64_t) ((nblocks + (sqlite3_int64) k - 1) / (sqlite3_int64) k) : 0;
+    if (ng < f->nflushed) {
+      f->hdr_dirty = 1;
+      f->have_dirty = 1;
+      rc = tk_enc_hdr_flush(f);
+      if (rc != SQLITE_OK)
+        return rc;
+      rc = f->p->pMethods->xSync(f->p, SQLITE_SYNC_NORMAL);
+      if (rc != SQLITE_OK)
+        return rc;
+    }
+    rc = f->p->pMethods->xTruncate(f->p, tk_enc_phys(f, nblocks));
+    if (rc != SQLITE_OK)
+      return rc;
+    if (ng < f->ngroups) {
+      memset(f->cdirty + ng, 0, f->ngroups - ng);
+      f->ngroups = ng;
+    }
+    if (ng < f->nflushed)
+      f->nflushed = ng;
+    tk_enc_root_calc(f, f->root);
+    f->lsize = size;
+    return tk_enc_hdr_flush(f);
+  }
+  rc = f->p->pMethods->xTruncate(f->p, tk_enc_phys(f, nblocks));
   if (rc != SQLITE_OK)
     return rc;
   f->lsize = size;
@@ -414,6 +732,11 @@ static int tk_enc_io_truncate (sqlite3_file *pf, sqlite3_int64 size)
 static int tk_enc_io_sync (sqlite3_file *pf, int flags)
 {
   tk_enc_file *f = (tk_enc_file *) pf;
+  if (f->counters) {
+    int rc = tk_enc_ctr_flush(f, flags);
+    if (rc != SQLITE_OK)
+      return rc;
+  }
   return f->p->pMethods->xSync(f->p, flags);
 }
 
@@ -452,8 +775,7 @@ static int tk_enc_io_file_control (sqlite3_file *pf, int op, void *arg)
 
     sqlite3_int64 sz = *(sqlite3_int64 *) arg;
     sqlite3_int64 nb = (sz + (sqlite3_int64) f->block - 1) / (sqlite3_int64) f->block;
-    sqlite3_int64 phys = (sqlite3_int64) TK_ENC_HDR +
-      nb * (sqlite3_int64) (f->block + TK_ENC_OVH);
+    sqlite3_int64 phys = tk_enc_phys(f, nb);
     return f->p->pMethods->xFileControl(f->p, op, &phys);
   }
   if (op == SQLITE_FCNTL_VFSNAME) {
@@ -583,6 +905,7 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
   softf |= SQLITE_OPEN_WAL;
 #endif
   f->softfail = (flags & softf) != 0;
+  f->counters = (flags & SQLITE_OPEN_MAIN_DB) != 0;
 
   int keyed = SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_MAIN_JOURNAL;
 #ifdef SQLITE_OPEN_WAL
@@ -616,6 +939,8 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
     tk_enc_random(f->salt, TK_ENC_SALT);
     f->lsize = 0;
     f->hashdr = 0;
+    if (f->counters)
+      tk_enc_root_calc(f, f->root);
   } else {
     unsigned char h[TK_ENC_HDR];
     if (psz < TK_ENC_HDR ||
@@ -635,6 +960,20 @@ static int tk_enc_vfs_open (sqlite3_vfs *pVfs, const char *zName,
     f->lsize = (sqlite3_int64) tk_enc_get64(h + 16);
     memcpy(f->salt, h + 24, TK_ENC_SALT);
     f->hashdr = 1;
+    if (f->counters) {
+      uint64_t ep = tk_enc_get64(h + 40);
+      int dirty = (ep & TK_ENC_DIRTY_BIT) != 0;
+      f->epoch = ep & ~TK_ENC_DIRTY_BIT;
+      memcpy(f->root, h + 48, TK_ENC_ROOT);
+      f->nflushed = tk_enc_get64(h + 64);
+      rc = tk_enc_ctr_load(f, dirty);
+      if (rc != SQLITE_OK) {
+        f->p->pMethods->xClose(f->p);
+        tk_enc_ctr_free(f);
+        crypto_wipe(f->key, TK_ENC_KEYLEN);
+        return rc;
+      }
+    }
   }
 
   f->base.pMethods =
