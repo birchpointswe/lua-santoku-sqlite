@@ -2,3 +2,4 @@
 .build
 build
 lib/santoku/sqlite/sqlite3.h
+tmp

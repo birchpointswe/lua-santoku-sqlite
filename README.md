@@ -6,7 +6,8 @@
 
 SQLite for Lua, with the amalgamation vendored in. Prepared statements are exposed as
 ordinary Lua functions, transactions take a Lua function, and the package adds a
-page-level encryption layer and a trigram search index on top of the raw bindings.
+page-level encryption layer, a trigram search index, and trigger-driven peer-to-peer
+sync on top of the raw bindings.
 
 ## Install
 
@@ -47,7 +48,8 @@ For agents and LLM tooling: [llms.txt](https://santoku.dev/llms.txt) for the ind
 The tests are the spec. For the exhaustive surface, read them:
 [`test/spec/santoku/sqlite/db.lua`](test/spec/santoku/sqlite/db.lua),
 [`test/spec/santoku/sqlite/enc.lua`](test/spec/santoku/sqlite/enc.lua),
-[`test/spec/santoku/sqlite/search.lua`](test/spec/santoku/sqlite/search.lua), and
+[`test/spec/santoku/sqlite/search.lua`](test/spec/santoku/sqlite/search.lua),
+[`test/spec/santoku/sqlite/sync.lua`](test/spec/santoku/sqlite/sync.lua), and
 [`test/spec/santoku/sqlite/carray.lua`](test/spec/santoku/sqlite/carray.lua).
 
 ## License
