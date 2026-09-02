@@ -38,12 +38,27 @@ EM_JS(void, tk_enc_js_random, (unsigned char *buf, int n), {
   (globalThis.crypto || globalThis.msCrypto).getRandomValues(a);
   HEAPU8.set(a, buf);
 });
+#elif defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__)
+#include <sys/random.h>
+#include <errno.h>
+#include <stdlib.h>
 #endif
 
 static void tk_enc_random (void *buf, size_t n)
 {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
   tk_enc_js_random((unsigned char *) buf, (int) n);
+#elif defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__)
+  unsigned char *p = (unsigned char *) buf;
+  while (n) {
+    ssize_t r = getrandom(p, n, 0);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      abort();
+    }
+    p += r;
+    n -= (size_t) r;
+  }
 #else
   arc4random_buf(buf, n);
 #endif
