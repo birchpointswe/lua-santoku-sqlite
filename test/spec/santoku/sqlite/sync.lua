@@ -363,6 +363,136 @@ test("sqlite.sync", function ()
     assert(eq("secret", b.title("n1")))
   end)
 
+  test("quiet suppresses capture, and nests inside apply without leaking", function ()
+    local a = notes_peer()
+    a.add("n1", "seed")
+    local before = a.sync.seq()
+    a.sync.quiet(function ()
+      a.settitle("n1", "projection only")
+    end)
+    assert(eq(before, a.sync.seq()))
+    assert(eq("projection only", a.title("n1")))
+
+    a.settitle("n1", "ordinary write")
+    assert(a.sync.seq() > before)
+
+    local ok = pcall(a.sync.quiet, function () error("boom") end)
+    assert(not ok)
+    local after_err = a.sync.seq()
+    a.settitle("n1", "capture still on")
+    assert(a.sync.seq() > after_err)
+
+    local nested_seen = nil
+    a.sync.quiet(function ()
+      a.sync.quiet(function ()
+        a.settitle("n1", "inner")
+      end)
+      local mid = a.sync.seq()
+      a.settitle("n1", "outer still quiet")
+      nested_seen = a.sync.seq() == mid
+    end)
+    assert(nested_seen, "inner quiet cleared the outer suppression")
+  end)
+
+  test("an unreadable record quarantines instead of wedging the whole batch", function ()
+    local function make (mode)
+      local db = sql(sqlite.open_memory())
+      db.exec("create table notes (id text primary key, title text not null default '')")
+      local s = sync.create(db, {
+        space = "t",
+        on_codec_error = mode,
+        tables = { notes = { pk = { "id" }, columns = { "title" } } },
+        encode = function (v) return v.id .. "\30" .. v.title end,
+        decode = function (s2)
+          local id, title = s2:match("^(.-)\30(.*)$")
+          return { id = id, title = title }
+        end,
+        codec = {
+          enc = function (plain, ad) return ad .. "|" .. plain end,
+          dec = function (ct, ad)
+            local got, plain = ct:match("^(.-)|(.*)$")
+            if got ~= ad then return nil, "auth_failed" end
+            return plain
+          end,
+        },
+      })
+      return {
+        sync = s,
+        add = db.runner("insert into notes (id, title) values (?1, ?2)"),
+        count = db.getter("select count(*) from notes"),
+        title = db.getter("select title from notes where id = ?1"),
+      }
+    end
+
+    local src = make("abort")
+    src.add("n1", "poison")
+    src.add("n2", "healthy")
+
+    local dst = make("quarantine")
+    local res = src.sync.respond(dst.sync.request(src.sync.id()))
+    for _, c in ipairs(res.changes) do
+      if c.rid:find("n1", 1, true) then c.ct = "tampered|garbage" end
+    end
+    local stats = dst.sync.apply(res)
+    assert(eq(1, #stats.unreadable))
+    assert(eq("auth_failed", stats.unreadable[1].reason))
+    assert(eq(1, stats.applied))
+    assert(eq("healthy", dst.title("n2")))
+    assert(eq(0, stats.cursor), "cursor must freeze while a record is unreadable")
+
+    local strict = make("abort")
+    local res2 = src.sync.respond(strict.sync.request(src.sync.id()))
+    for _, c in ipairs(res2.changes) do
+      if c.rid:find("n1", 1, true) then c.ct = "tampered|garbage" end
+    end
+    assert(not pcall(strict.sync.apply, res2))
+    assert(eq(0, strict.count()), "abort mode must roll the whole batch back")
+  end)
+
+  test("a custom aad hook is used on both sides and is bound per record", function ()
+    local seen = {}
+    local function make ()
+      local db = sql(sqlite.open_memory())
+      db.exec("create table notes (id text primary key, title text not null default '')")
+      local s = sync.create(db, {
+        space = "acct",
+        tables = { notes = { pk = { "id" }, columns = { "title" } } },
+        aad = function (sp, _, rid, hlc)
+          return sp .. ":" .. (rid:match('^%["(.-)"%]$') or rid) .. ":" .. hlc
+        end,
+        encode = function (v) return v.id .. "\30" .. v.title end,
+        decode = function (s2)
+          local id, title = s2:match("^(.-)\30(.*)$")
+          return { id = id, title = title }
+        end,
+        codec = {
+          enc = function (plain, ad)
+            seen[#seen + 1] = ad
+            return ad .. "|" .. plain
+          end,
+          dec = function (ct, ad)
+            local got, plain = ct:match("^(.-)|(.*)$")
+            if got ~= ad then return nil, "auth_failed" end
+            return plain
+          end,
+        },
+      })
+      return {
+        sync = s,
+        add = db.runner("insert into notes (id, title) values (?1, ?2)"),
+        title = db.getter("select title from notes where id = ?1"),
+      }
+    end
+    local a, b = make(), make()
+    a.add("n1", "secret")
+    local res = a.sync.respond(b.sync.request(a.sync.id()))
+    assert(seen[1]:match("^acct:n1:"), "aad hook not used: " .. tostring(seen[1]))
+    assert(not seen[1]:find("notes", 1, true), "table name should be absent from custom aad")
+    assert(not seen[1]:find("[", 1, true), "rid should be unwrapped by the hook")
+    b.sync.apply(res)
+    assert(eq("secret", b.title("n1")))
+  end)
+
   test("a change from far in the future is quarantined, not applied", function ()
     local a, b = notes_peer(), notes_peer()
     b.add("n1", "fine")

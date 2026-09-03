@@ -1,6 +1,7 @@
 local err = require("santoku.error")
 local error = err.error
 local assert = err.assert
+local pcall = err.pcall
 
 local PROTO = 1
 local BUCKETS = 256
@@ -60,6 +61,19 @@ local function create (db, opts)
 
   local hash = opts.hash or strhash
   assert(type(hash) == "function", "sync.create: opts.hash must be a function")
+
+  local aad = opts.aad
+  if aad ~= nil then
+    assert(type(aad) == "function", "sync.create: opts.aad must be a function")
+  else
+    aad = function (sp, tbl, rid, hlc)
+      return sp .. ":" .. tbl .. ":" .. rid .. ":" .. hlc
+    end
+  end
+
+  local on_codec_error = opts.on_codec_error or "abort"
+  assert(on_codec_error == "abort" or on_codec_error == "quarantine",
+    "sync.create: opts.on_codec_error must be abort or quarantine")
 
   local codec, encode, decode = opts.codec, opts.encode, opts.decode
   if codec ~= nil then
@@ -241,7 +255,10 @@ local function create (db, opts)
   local get_gc_seq = db.getter("select gc_seq from " .. meta .. " where id = 1")
   local set_gc = db.runner(
     "update " .. meta .. " set gc_hlc = ?1, gc_seq = seq where id = 1")
-  local set_applying = db.runner("update " .. meta .. " set applying = ?1 where id = 1")
+  local enter_quiet = db.runner(
+    "update " .. meta .. " set applying = applying + 1 where id = 1")
+  local exit_quiet = db.runner(
+    "update " .. meta .. " set applying = max(0, applying - 1) where id = 1")
   local bump_clock = db.runner(
     "update " .. meta .. " set " ..
     "c = case when " .. NOW .. " > pt then 0 else c + 1 end, " ..
@@ -364,7 +381,7 @@ local function create (db, opts)
   local replica = get_replica()
 
   db.transaction(function ()
-    set_applying(1)
+    enter_quiet()
     for _, name in ipairs(names) do
       local t = T[name]
       bump_clock()
@@ -376,7 +393,7 @@ local function create (db, opts)
         t.backfill_cols("[" .. table.concat(list, ",") .. "]")
       end
     end
-    set_applying(0)
+    exit_quiet()
   end)
 
   local function pack (name, r)
@@ -398,7 +415,7 @@ local function create (db, opts)
       e.hlcs = hlcs
     end
     if codec then
-      e.ct = codec.enc(encode(vals), space .. ":" .. name .. ":" .. r.rid .. ":" .. r.hlc)
+      e.ct = codec.enc(encode(vals), aad(space, name, r.rid, r.hlc))
     else
       e.vals = vals
     end
@@ -521,8 +538,7 @@ local function create (db, opts)
 
   local function unpack_vals (name, e)
     if e.ct then
-      local plain, derr = codec.dec(e.ct,
-        space .. ":" .. name .. ":" .. e.rid .. ":" .. e.hlc)
+      local plain, derr = codec.dec(e.ct, aad(space, name, e.rid, e.hlc))
       if not plain then return nil, derr or "codec" end
       local ok, vals = pcall(decode, plain)
       if not ok or type(vals) ~= "table" then return nil, "codec" end
@@ -530,6 +546,15 @@ local function create (db, opts)
     end
     if type(e.vals) ~= "table" then return nil, "malformed" end
     return e.vals
+  end
+
+  local function unreadable (e, reason, stats)
+    if on_codec_error ~= "quarantine" then
+      return error("sync.apply: " .. tostring(reason) .. " in " .. tostring(e.t))
+    end
+    stats.unreadable[#stats.unreadable + 1] = {
+      t = e.t, rid = e.rid, hlc = e.hlc, reason = reason or "codec",
+    }
   end
 
   local function apply_one (e, stats)
@@ -552,7 +577,7 @@ local function create (db, opts)
     local ldel = cur and cur.del == 1 or false
     if t.column and not e.del and cur and not ldel then
       local vals, derr = unpack_vals(e.t, e)
-      if not vals then return error("sync.apply: " .. derr .. " in " .. e.t) end
+      if not vals then return unreadable(e, derr, stats) end
       local locals = {}
       for _, cr in ipairs(t.get_cols(e.rid)) do locals[cr.col] = cr.hlc end
       local took, top = false, lhlc
@@ -585,7 +610,7 @@ local function create (db, opts)
       return
     end
     local vals, derr = unpack_vals(e.t, e)
-    if not vals then return error("sync.apply: " .. derr .. " in " .. e.t) end
+    if not vals then return unreadable(e, derr, stats) end
     local args = {}
     for _, c in ipairs(t.all_cols) do
       args[c] = vals[c]
@@ -612,11 +637,12 @@ local function create (db, opts)
       applied = 0,
       skipped = 0,
       poisoned = 0,
+      unreadable = {},
       more = res.more and true or false,
     }
     db.transaction(function ()
       db.exec("pragma defer_foreign_keys = on")
-      set_applying(1)
+      enter_quiet()
       local top = nil
       for _, e in ipairs(res.changes or {}) do
         ratchet(hlc_parse(e.hlc))
@@ -627,12 +653,24 @@ local function create (db, opts)
         ratchet(hlc_parse(e.hlc))
         apply_one(e, stats)
       end
-      set_applying(0)
+      exit_quiet()
       local seq = tonumber(res.seq) or 0
-      if seq > 0 then set_cursor(res.replica, seq) end
+      if seq > 0 and #stats.unreadable == 0 then set_cursor(res.replica, seq) end
       stats.cursor = get_cursor(res.replica) or 0
     end)
     return stats
+  end
+
+  local function quiet (fn, ...)
+    assert(type(fn) == "function", "sync.quiet: function required")
+    enter_quiet()
+    return (function (ok, ...)
+      exit_quiet()
+      if not ok then
+        return error(...)
+      end
+      return ...
+    end)(pcall(fn, ...))
   end
 
   local function digest ()
@@ -762,6 +800,7 @@ local function create (db, opts)
     apply = apply,
     push = push,
     ack = ack,
+    quiet = quiet,
     digest = digest,
     compare = compare,
     manifest = manifest,
