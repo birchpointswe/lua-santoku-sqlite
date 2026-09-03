@@ -123,7 +123,20 @@ local function create (db, opts)
       assert(found, "sync.create: " .. name .. " blob column not in columns: " .. tostring(c))
       blob[c] = true
     end
-    specs[name] = { pk = pk, columns = cols, granularity = gran, blob = blob, version = version }
+    local after_apply = spec.after_apply
+    assert(after_apply == nil or type(after_apply) == "function",
+      "sync.create: " .. name .. " after_apply must be a function")
+    local seed = spec.seed
+    if seed ~= nil then
+      assert(valid_name(seed),
+        "sync.create: " .. name .. " seed must be a valid identifier")
+      for _, c in ipairs(pk) do
+        assert(seed ~= c,
+          "sync.create: " .. name .. " seed cannot be a pk column: " .. seed)
+      end
+    end
+    specs[name] = { pk = pk, columns = cols, granularity = gran, blob = blob,
+      version = version, after_apply = after_apply, seed = seed }
     versions[name] = version
     names[#names + 1] = name
   end
@@ -293,6 +306,14 @@ local function create (db, opts)
     local rid_t = rid_expr(name)
     local rid_q = rid_expr(name, name)
 
+    local minted_hlc =
+      "(select printf('%014d', pt) || '.' || printf('%08x', c) from " .. meta ..
+      " where id = 1) || '.' || lower(hex(randomblob(8)))"
+    if spec.seed then
+      minted_hlc = "coalesce(nullif(" .. name .. "." .. spec.seed .. ", ''), " ..
+        minted_hlc .. ")"
+    end
+
     local sel = {}
     local all_cols = {}
     for _, c in ipairs(spec.pk) do all_cols[#all_cols + 1] = c end
@@ -392,12 +413,12 @@ local function create (db, opts)
       del_cols = column and db.runner("delete from " .. colshadow .. " where rid = ?1") or nil,
       backfill = db.runner(
         "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
-        "select " .. rid_q .. ", (select printf('%014d', pt) || '.' || printf('%08x', c) " ..
-        "from " .. meta .. " where id = 1) || '.' || lower(hex(randomblob(8))), " ..
+        "select " .. rid_q .. ", " .. minted_hlc .. ", " ..
         "(select seq from " .. meta .. " where id = 1) + " ..
         "row_number() over (order by " .. table.concat(spec.pk, ", ") .. "), 0 " ..
         "from " .. name .. " where not exists (select 1 from " .. shadow ..
         " s where s.rid = " .. rid_q .. ")"),
+      max_hlc = spec.seed and db.getter("select max(hlc) from " .. shadow) or nil,
       backfill_cols = column and db.runner(
         "insert into " .. colshadow .. " (rid, col, hlc) " ..
         "select s.rid, x.value, s.hlc from " .. shadow .. " s, " ..
@@ -415,6 +436,10 @@ local function create (db, opts)
       bump_clock()
       t.backfill()
       t.seq_catchup()
+      if t.max_hlc then
+        local pt, c = hlc_parse(t.max_hlc())
+        if pt then ratchet(pt, c) end
+      end
       if t.column then
         local list = {}
         for i, c in ipairs(t.spec.columns) do list[i] = '"' .. c .. '"' end
@@ -621,6 +646,9 @@ local function create (db, opts)
       if took then
         t.put_shadow(e.rid, top, next_seq(), 0)
         stats.applied = stats.applied + 1
+        if t.spec.after_apply then
+          t.spec.after_apply("update", e.rid, vals, top)
+        end
       else
         stats.skipped = stats.skipped + 1
       end
@@ -635,6 +663,9 @@ local function create (db, opts)
       if t.column then t.del_cols(e.rid) end
       t.put_shadow(e.rid, e.hlc, next_seq(), 1)
       stats.applied = stats.applied + 1
+      if t.spec.after_apply then
+        t.spec.after_apply("delete", e.rid, nil, e.hlc)
+      end
       return
     end
     local vals, derr = unpack_vals(e.t, e)
@@ -652,6 +683,10 @@ local function create (db, opts)
     end
     t.put_shadow(e.rid, e.hlc, next_seq(), 0)
     stats.applied = stats.applied + 1
+    if t.spec.after_apply then
+      t.spec.after_apply((cur == nil or ldel) and "insert" or "update",
+        e.rid, vals, e.hlc)
+    end
   end
 
   local function apply (res)

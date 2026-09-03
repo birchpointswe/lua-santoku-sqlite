@@ -47,6 +47,11 @@ local function pull (dst, src)
   return dst.sync.apply(src.sync.respond(dst.sync.request(src.sync.id())))
 end
 
+local function hlcish (h)
+  return type(h) == "string"
+    and h:match("^%d%d%d%d%d%d%d%d%d%d%d%d%d%d%.%x%x%x%x%x%x%x%x%.%x+$") ~= nil
+end
+
 local function converge (a, b)
   for _ = 1, 20 do
     local x = pull(a, b)
@@ -392,6 +397,163 @@ test("sqlite.sync", function ()
       nested_seen = a.sync.seq() == mid
     end)
     assert(nested_seen, "inner quiet cleared the outer suppression")
+  end)
+
+  test("after_apply fires per applied row with op, rid, vals and hlc", function ()
+    local function make (log)
+      local db = sql(sqlite.open_memory())
+      db.exec([[
+        create table notes (
+          id text primary key,
+          title text not null default '',
+          shout text not null default ''
+        )
+      ]])
+      local s = sync.create(db, {
+        space = "t",
+        tables = {
+          notes = {
+            pk = { "id" }, columns = { "title" },
+            after_apply = log and function (op, rid, vals, hlc)
+              log[#log + 1] = { op = op, rid = rid,
+                title = vals and vals.title or nil, hlc = hlc }
+              if op ~= "delete" then
+                db.exec("update notes set shout = upper(title) where "
+                  .. "json_array(id) = '" .. rid .. "'")
+              end
+            end or nil,
+          },
+        },
+      })
+      return {
+        db = db, sync = s,
+        add = db.runner("insert into notes (id, title) values (?1, ?2)"),
+        settitle = db.runner("update notes set title = ?2 where id = ?1"),
+        drop = db.runner("delete from notes where id = ?1"),
+        shout = db.getter("select shout from notes where id = ?1"),
+        count = db.getter("select count(*) from notes"),
+      }
+    end
+
+    local log = {}
+    local src, dst = make(nil), make(log)
+    src.add("n1", "hello")
+    pull(dst, src)
+    assert(eq(1, #log))
+    assert(eq("insert", log[1].op))
+    assert(eq("hello", log[1].title))
+    assert(log[1].rid:find("n1", 1, true) ~= nil)
+    assert(hlcish(log[1].hlc), "after_apply got no usable hlc")
+    assert(eq("HELLO", dst.shout("n1")))
+
+    src.settitle("n1", "again")
+    pull(dst, src)
+    assert(eq(2, #log))
+    assert(eq("update", log[2].op))
+    assert(eq("AGAIN", dst.shout("n1")))
+
+    src.drop("n1")
+    pull(dst, src)
+    assert(eq(3, #log))
+    assert(eq("delete", log[3].op))
+    assert(eq(nil, log[3].title))
+    assert(eq(0, dst.count()))
+  end)
+
+  test("after_apply writes are not recaptured as local changes", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("create table notes (id text primary key, title text default '', shout text default '')")
+    local s = sync.create(db, {
+      space = "t",
+      tables = {
+        notes = {
+          pk = { "id" }, columns = { "title" },
+          after_apply = function (op, rid)
+            if op ~= "delete" then
+              db.exec("update notes set shout = 'derived' where json_array(id) = '" .. rid .. "'")
+            end
+          end,
+        },
+      },
+    })
+    local src = notes_peer()
+    src.add("n1", "hello")
+    local dst = { sync = s, db = db }
+    local res = src.sync.respond(dst.sync.request(src.sync.id()))
+    dst.sync.apply(res)
+    local shadow_hlc = db.getter("select hlc from notes_sync where rid = json_array('n1')")
+    assert(eq(res.changes[1].hlc, shadow_hlc()),
+      "after_apply write re-stamped the row and would echo back")
+  end)
+
+  test("seed backfills from an existing version column", function ()
+    local function make (seeded)
+      local db = sql(sqlite.open_memory())
+      db.exec("create table notes (id text primary key, title text default '', ver text)")
+      return db, function ()
+        return sync.create(db, {
+          space = "t",
+          tables = {
+            notes = { pk = { "id" }, columns = { "title" }, seed = seeded and "ver" or nil },
+          },
+        })
+      end
+    end
+
+    local db, mk = make(true)
+    local add = db.runner("insert into notes (id, title, ver) values (?1, ?2, ?3)")
+    local old = "00000000000001.00000000.00000000000000aa"
+    add("n1", "seeded", old)
+    add("n2", "unseeded", nil)
+    mk()
+    local hlc_of = db.getter("select hlc from notes_sync where rid = json_array(?1)")
+    assert(eq(old, hlc_of("n1")), "seed column was not used")
+    assert(hlcish(hlc_of("n2")), "null seed did not fall back to a minted clock")
+    assert(hlc_of("n2") > old, "minted fallback did not exceed the seeded value")
+
+    local db2 = sql(sqlite.open_memory())
+    db2.exec("create table notes (id text primary key, title text default '', ver text)")
+    db2.runner("insert into notes (id, title, ver) values (?1, ?2, ?3)")("n1", "x", old)
+    sync.create(db2, {
+      space = "t",
+      tables = { notes = { pk = { "id" }, columns = { "title" } } },
+    })
+    local plain = db2.getter("select hlc from notes_sync where rid = json_array('n1')")
+    assert(plain() ~= old, "seed applied without being configured")
+  end)
+
+  test("the clock ratchets past seeded values so local writes outrank them", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("create table notes (id text primary key, title text default '', ver text)")
+    local now = db.getter("select cast(round(unixepoch('now', 'subsec') * 1000) as integer)")
+    local soon = string.format("%014d.%08x.%016x", now() + 60000, 0, 0)
+    db.runner("insert into notes (id, title, ver) values (?1, ?2, ?3)")("n1", "seeded", soon)
+    sync.create(db, {
+      space = "t",
+      tables = { notes = { pk = { "id" }, columns = { "title" }, seed = "ver" } },
+    })
+    local hlc_of = db.getter("select hlc from notes_sync where rid = json_array('n1')")
+    assert(eq(soon, hlc_of()))
+    db.exec("update notes set title = 'local edit' where id = 'n1'")
+    assert(hlc_of() > soon,
+      "clock did not ratchet past the seeded value, so a local write lost to it")
+  end)
+
+  test("a seed beyond the skew bound is kept but does not poison the clock", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("create table notes (id text primary key, title text default '', ver text)")
+    local far = "99999999999998.00000000.00000000000000aa"
+    db.runner("insert into notes (id, title, ver) values (?1, ?2, ?3)")("n1", "seeded", far)
+    sync.create(db, {
+      space = "t",
+      tables = { notes = { pk = { "id" }, columns = { "title" }, seed = "ver" } },
+    })
+    local hlc_of = db.getter("select hlc from notes_sync where rid = json_array('n1')")
+    assert(eq(far, hlc_of()), "seed was discarded")
+    db.exec("insert into notes (id, title) values ('n2', 'fresh')")
+    local other = db.getter("select hlc from notes_sync where rid = json_array('n2')")
+    assert(other() < far, "an implausible seed dragged the clock forward")
+    assert(hlcish(other()))
   end)
 
   test("quiet does not commit the suppression flag to other connections", function ()
