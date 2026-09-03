@@ -301,18 +301,46 @@ local function create (db, opts)
       sel[i] = spec.blob[c] and ("hex(b." .. c .. ") as " .. c) or ("b." .. c .. " as " .. c)
     end
 
-    local enum = db.all(
-      "select s.rid as rid, s.hlc as hlc, s.seq as seq, s.del as del, " ..
+    local enum_live = db.all(
+      "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
       table.concat(sel, ", ") ..
-      " from " .. shadow .. " s left join " .. base .. " b on " ..
+      " from " .. shadow .. " s join " .. base .. " b on " ..
       rid_expr(name, "b") .. " = s.rid " ..
-      "where s.seq > ?1 order by s.seq limit ?2", true)
+      "where s.del = 0 and s.seq > ?1 order by s.seq limit ?2", true)
 
-    local fetch_one = db.all(
-      "select s.rid as rid, s.hlc as hlc, s.seq as seq, s.del as del, " ..
+    local enum_dead = db.all(
+      "select rid, hlc, seq, 1 as del from " .. shadow ..
+      " where del = 1 and seq > ?1 order by seq limit ?2", true)
+
+    local function enum (from, lim)
+      local out = enum_live(from, lim)
+      for _, r in ipairs(enum_dead(from, lim)) do
+        out[#out + 1] = r
+      end
+      table.sort(out, function (a, b) return a.seq < b.seq end)
+      if #out > lim then
+        local cut = {}
+        for i = 1, lim do cut[i] = out[i] end
+        return cut
+      end
+      return out
+    end
+
+    local fetch_live = db.all(
+      "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
       table.concat(sel, ", ") ..
-      " from " .. shadow .. " s left join " .. base .. " b on " ..
-      rid_expr(name, "b") .. " = s.rid where s.rid = ?1", true)
+      " from " .. shadow .. " s join " .. base .. " b on " ..
+      rid_expr(name, "b") .. " = s.rid where s.rid = ?1 and s.del = 0", true)
+
+    local fetch_dead = db.all(
+      "select rid, hlc, seq, 1 as del from " .. shadow ..
+      " where rid = ?1 and del = 1", true)
+
+    local function fetch_one (rid)
+      local out = fetch_live(rid)
+      if #out > 0 then return out end
+      return fetch_dead(rid)
+    end
 
     local ph, setters = {}, {}
     for i, c in ipairs(all_cols) do
@@ -663,14 +691,16 @@ local function create (db, opts)
 
   local function quiet (fn, ...)
     assert(type(fn) == "function", "sync.quiet: function required")
-    enter_quiet()
-    return (function (ok, ...)
-      exit_quiet()
-      if not ok then
-        return error(...)
-      end
-      return ...
-    end)(pcall(fn, ...))
+    return db.transaction(function (...)
+      enter_quiet()
+      return (function (ok, ...)
+        exit_quiet()
+        if not ok then
+          return error(...)
+        end
+        return ...
+      end)(pcall(fn, ...))
+    end, ...)
   end
 
   local function digest ()

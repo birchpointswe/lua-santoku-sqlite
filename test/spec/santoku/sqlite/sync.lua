@@ -394,6 +394,63 @@ test("sqlite.sync", function ()
     assert(nested_seen, "inner quiet cleared the outer suppression")
   end)
 
+  test("quiet does not commit the suppression flag to other connections", function ()
+    local path = (os.getenv("TMPDIR") or ".") .. "/santoku-sync-quiet-test.db"
+    os.remove(path)
+    local a = sql(sqlite.open(path))
+    a.exec("pragma busy_timeout = 5000")
+    a.exec("pragma journal_mode = WAL")
+    a.exec("create table notes (id text primary key, title text not null default '')")
+    local sa = sync.create(a, {
+      space = "t",
+      tables = { notes = { pk = { "id" }, columns = { "title" } } },
+    })
+    local b = sql(sqlite.open(path))
+    b.exec("pragma busy_timeout = 5000")
+    local b_applying = b.getter("select applying from sync_meta where id = 1")
+    local seen
+    sa.quiet(function ()
+      seen = b_applying()
+    end)
+    assert(eq(0, seen), "quiet leaked the applying flag to another connection")
+    assert(eq(0, b_applying()))
+    a.close()
+    b.close()
+    os.remove(path)
+  end)
+
+  test("a crash inside quiet leaves capture enabled", function ()
+    local a = notes_peer()
+    local applying = a.db.getter("select applying from sync_meta where id = 1")
+    assert(not pcall(a.sync.quiet, function () error("boom") end))
+    assert(eq(0, applying()), "applying stuck on after an error inside quiet")
+    local before = a.sync.seq()
+    a.add("after", "still captured")
+    assert(a.sync.seq() > before, "capture stayed suppressed after a failed quiet")
+  end)
+
+  test("tombstones enumerate without a base row present", function ()
+    local a, b = notes_peer(), notes_peer()
+    a.add("n1", "one")
+    a.add("n2", "two")
+    converge(a, b)
+    a.drop("n1")
+    local res = a.sync.respond(b.sync.request(a.sync.id()))
+    local tomb = nil
+    for _, c in ipairs(res.changes) do
+      if c.del then tomb = c end
+    end
+    assert(tomb ~= nil, "delete did not enumerate")
+    assert(tomb.rid:find("n1", 1, true) ~= nil)
+    b.sync.apply(res)
+    assert(eq(1, b.count()))
+    local fetched = a.sync.respond(b.sync.request(a.sync.id(), {
+      fetch = { notes = { tomb.rid } },
+    }))
+    assert(fetched.fetched ~= nil and #fetched.fetched == 1)
+    assert(fetched.fetched[1].del == true, "fetch lost the tombstone")
+  end)
+
   test("an unreadable record quarantines instead of wedging the whole batch", function ()
     local function make (mode)
       local db = sql(sqlite.open_memory())
