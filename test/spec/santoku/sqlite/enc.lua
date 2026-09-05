@@ -5,9 +5,12 @@ local assert = err.assert
 
 local sqlite = require("santoku.sqlite.db")
 local sql = require("santoku.sqlite")
+local str = require("santoku.string")
+local num = require("santoku.num")
+local fs = require("santoku.fs")
 
-local KEY_A = string.rep("A", 32)
-local KEY_B = string.rep("B", 32)
+local KEY_A = str.rep("A", 32)
+local KEY_B = str.rep("B", 32)
 
 local WAL_OK = not sqlite.wasm
 
@@ -19,18 +22,15 @@ local function tmpname (n)
 end
 
 local function rm (p)
-  os.remove(p)
-  os.remove(p .. "-journal")
-  os.remove(p .. "-wal")
-  os.remove(p .. "-shm")
+  fs.rm(p, true)
+  fs.rm(p .. "-journal", true)
+  fs.rm(p .. "-wal", true)
+  fs.rm(p .. "-shm", true)
 end
 
 local function slurp (p)
-  local fh = io.open(p, "rb")
-  if not fh then return nil end
-  local s = fh:read("*a")
-  fh:close()
-  return s
+  if not fs.exists(p) then return nil end
+  return fs.readfile(p, "rb")
 end
 
 local function seed (db, rows)
@@ -313,9 +313,7 @@ local FRAME = BLOCK + OVH
 local DATA0 = HDR + FRAME
 
 local function spit (p, s)
-  local fh = assert(io.open(p, "wb"))
-  fh:write(s)
-  fh:close()
+  fs.writefile(p, s, "wb")
 end
 
 local function frame_nonce (blob, i)
@@ -356,7 +354,7 @@ test("a tampered frame fails the read instead of returning garbage", function ()
 
   local pos = DATA0 + 24 + 100
   local byte = blob:byte(pos + 1)
-  local flipped = string.char((byte + 1) % 256)
+  local flipped = str.char((byte + 1) % 256)
   spit(p, blob:sub(1, pos) .. flipped .. blob:sub(pos + 2))
 
   local ok = pcall(function ()
@@ -442,7 +440,7 @@ end)
 test("values larger than a block round-trip (overflow pages)", function ()
   local p = tmpname("big")
   rm(p)
-  local big = string.rep("x", 200000) .. "-END"
+  local big = str.rep("x", 200000) .. "-END"
   local raw = sqlite.open_encrypted(p, KEY_A)
   local db = sql(raw)
   db.runner("create table blobs (id integer primary key, body text)")()
@@ -540,7 +538,7 @@ test("a hot journal is decrypted and rolled back on a cold open", function ()
 
   local p, pj, pn = tmpname("hotj"), tmpname("hotj-withj"), tmpname("hotj-noj")
   rm(p) rm(pj) rm(pn)
-  local pad = string.rep("z", 600)
+  local pad = str.rep("z", 600)
   local raw = sqlite.open_encrypted(p, KEY_A)
   local db = sql(raw)
   db.exec("pragma cache_size = 16")
@@ -671,12 +669,12 @@ test("wal: a corrupted tail recovers instead of failing the open", function ()
   raw:close_vm() raw:close()
   assert(snap_wal ~= nil and #snap_wal > HDR + 2 * FRAME, "wal was empty before the tear")
 
-  local cut = #snap_wal - math.floor(FRAME / 2)
+  local cut = #snap_wal - num.floor(FRAME / 2)
   local byte = snap_wal:byte(cut)
   spit(p, snap_db or "")
   spit(p .. "-wal",
-    snap_wal:sub(1, cut - 1) .. string.char((byte + 1) % 256) .. snap_wal:sub(cut + 1))
-  os.remove(p .. "-shm")
+    snap_wal:sub(1, cut - 1) .. str.char((byte + 1) % 256) .. snap_wal:sub(cut + 1))
+  fs.rm(p .. "-shm", true)
   local raw2 = sqlite.open_encrypted(p, KEY_A)
   assert(raw2 ~= nil, "torn wal tail made the database unopenable")
   local db2 = sql(raw2)
@@ -775,7 +773,7 @@ test("a version-1 container is rejected", function ()
   seed(sql(raw), 5)
   raw:close_vm() raw:close()
   local blob = slurp(p)
-  spit(p, blob:sub(1, 8) .. string.char(1) .. blob:sub(10))
+  spit(p, blob:sub(1, 8) .. str.char(1) .. blob:sub(10))
   local ok = pcall(function ()
     local r = sqlite.open_encrypted(p, KEY_A)
     if r == nil then error("open failed") end

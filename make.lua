@@ -16,7 +16,7 @@ end
 
 local env = {
   name = "santoku-sqlite",
-  version = "3.2.3-1",
+  version = "3.2.4-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,
@@ -39,6 +39,7 @@ local env = {
   test = {
     dependencies = {
       "santoku-matrix >= 2.0.0, < 3.0.0",
+      "santoku-fs >= 2.0.0, < 3.0.0",
     },
   },
   configure = function (submake, envs)

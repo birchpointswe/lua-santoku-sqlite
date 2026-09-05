@@ -9,6 +9,9 @@ local eq = validate.isequal
 local sqlite = require("santoku.sqlite.db")
 local sql = require("santoku.sqlite")
 local sync = require("santoku.sqlite.sync")
+local str = require("santoku.string")
+local fs = require("santoku.fs")
+local env = require("santoku.env")
 
 local function notes_peer (topts, sopts)
   local db = sql(sqlite.open_memory())
@@ -526,7 +529,7 @@ test("sqlite.sync", function ()
     local db = sql(sqlite.open_memory())
     db.exec("create table notes (id text primary key, title text default '', ver text)")
     local now = db.getter("select cast(round(unixepoch('now', 'subsec') * 1000) as integer)")
-    local soon = string.format("%014d.%08x.%016x", now() + 60000, 0, 0)
+    local soon = str.format("%014d.%08x.%016x", now() + 60000, 0, 0)
     db.runner("insert into notes (id, title, ver) values (?1, ?2, ?3)")("n1", "seeded", soon)
     sync.create(db, {
       space = "t",
@@ -557,8 +560,8 @@ test("sqlite.sync", function ()
   end)
 
   test("quiet does not commit the suppression flag to other connections", function ()
-    local path = (os.getenv("TMPDIR") or ".") .. "/santoku-sync-quiet-test.db"
-    os.remove(path)
+    local path = env.var("TMPDIR", ".") .. "/santoku-sync-quiet-test.db"
+    fs.rm(path, true)
     local a = sql(sqlite.open(path))
     a.exec("pragma busy_timeout = 5000")
     a.exec("pragma journal_mode = WAL")
@@ -578,7 +581,7 @@ test("sqlite.sync", function ()
     assert(eq(0, b_applying()))
     a.close()
     b.close()
-    os.remove(path)
+    fs.rm(path, true)
   end)
 
   test("a crash inside quiet leaves capture enabled", function ()

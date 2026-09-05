@@ -1,4 +1,5 @@
 local err = require("santoku.error")
+local arr = require("santoku.array")
 local error = err.error
 local assert = err.assert
 local pcall = err.pcall
@@ -141,7 +142,7 @@ local function create (db, opts)
     names[#names + 1] = name
   end
 
-  table.sort(names)
+  arr.sort(names)
 
   local q = schema and (schema .. ".") or ""
   local meta = q .. prefix .. "_meta"
@@ -156,7 +157,7 @@ local function create (db, opts)
     for i, c in ipairs(specs[name].pk) do
       parts[i] = alias and (alias .. "." .. c) or c
     end
-    return "json_array(" .. table.concat(parts, ", ") .. ")"
+    return "json_array(" .. arr.concat(parts, ", ") .. ")"
   end
 
   db.exec(
@@ -256,7 +257,7 @@ local function create (db, opts)
       guard .. " begin " .. ins_body .. " end;" ..
       "drop trigger if exists " .. q .. name .. "_" .. prefix .. "_au;" ..
       "create trigger " .. q .. name .. "_" .. prefix .. "_au after update of " ..
-      table.concat(watch, ", ") .. " on " .. name .. " " ..
+      arr.concat(watch, ", ") .. " on " .. name .. " " ..
       guard .. " begin " .. upd_body .. " end;" ..
       "drop trigger if exists " .. q .. name .. "_" .. prefix .. "_ad;" ..
       "create trigger " .. q .. name .. "_" .. prefix .. "_ad after delete on " .. name .. " " ..
@@ -324,7 +325,7 @@ local function create (db, opts)
 
     local enum_live = db.all(
       "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
-      table.concat(sel, ", ") ..
+      arr.concat(sel, ", ") ..
       " from " .. shadow .. " s join " .. base .. " b on " ..
       rid_expr(name, "b") .. " = s.rid " ..
       "where s.del = 0 and s.seq > ?1 order by s.seq limit ?2", true)
@@ -338,7 +339,7 @@ local function create (db, opts)
       for _, r in ipairs(enum_dead(from, lim)) do
         out[#out + 1] = r
       end
-      table.sort(out, function (a, b) return a.seq < b.seq end)
+      arr.sort(out, function (a, b) return a.seq < b.seq end)
       if #out > lim then
         local cut = {}
         for i = 1, lim do cut[i] = out[i] end
@@ -349,7 +350,7 @@ local function create (db, opts)
 
     local fetch_live = db.all(
       "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
-      table.concat(sel, ", ") ..
+      arr.concat(sel, ", ") ..
       " from " .. shadow .. " s join " .. base .. " b on " ..
       rid_expr(name, "b") .. " = s.rid where s.rid = ?1 and s.del = 0", true)
 
@@ -372,9 +373,9 @@ local function create (db, opts)
     end
 
     local upsert_base = db.runner(
-      "insert into " .. base .. " (" .. table.concat(all_cols, ", ") .. ") values (" ..
-      table.concat(ph, ", ") .. ") on conflict (" .. table.concat(spec.pk, ", ") ..
-      ") do update set " .. table.concat(setters, ", "))
+      "insert into " .. base .. " (" .. arr.concat(all_cols, ", ") .. ") values (" ..
+      arr.concat(ph, ", ") .. ") on conflict (" .. arr.concat(spec.pk, ", ") ..
+      ") do update set " .. arr.concat(setters, ", "))
 
     local col_set = {}
     if column then
@@ -415,7 +416,7 @@ local function create (db, opts)
         "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
         "select " .. rid_q .. ", " .. minted_hlc .. ", " ..
         "(select seq from " .. meta .. " where id = 1) + " ..
-        "row_number() over (order by " .. table.concat(spec.pk, ", ") .. "), 0 " ..
+        "row_number() over (order by " .. arr.concat(spec.pk, ", ") .. "), 0 " ..
         "from " .. name .. " where not exists (select 1 from " .. shadow ..
         " s where s.rid = " .. rid_q .. ")"),
       max_hlc = spec.seed and db.getter("select max(hlc) from " .. shadow) or nil,
@@ -443,7 +444,7 @@ local function create (db, opts)
       if t.column then
         local list = {}
         for i, c in ipairs(t.spec.columns) do list[i] = '"' .. c .. '"' end
-        t.backfill_cols("[" .. table.concat(list, ",") .. "]")
+        t.backfill_cols("[" .. arr.concat(list, ",") .. "]")
       end
     end
     exit_quiet()
@@ -482,7 +483,7 @@ local function create (db, opts)
         rows[#rows + 1] = { seq = r.seq, name = name, row = r }
       end
     end
-    table.sort(rows, function (a, b)
+    arr.sort(rows, function (a, b)
       if a.seq == b.seq then return a.name < b.name end
       return a.seq < b.seq
     end)
@@ -851,7 +852,7 @@ local function create (db, opts)
     versions[name] = nil
     for i = 1, #names do
       if names[i] == name then
-        table.remove(names, i)
+        arr.remove(names, i, i)
         break
       end
     end

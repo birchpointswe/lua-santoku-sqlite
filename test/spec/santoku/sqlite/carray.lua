@@ -15,6 +15,7 @@ local sql = require("santoku.sqlite")
 
 local ivec = require("santoku.ivec")
 local fvec = require("santoku.fvec")
+local num = require("santoku.num")
 
 local function drain (stmt)
   local out = {}
@@ -72,8 +73,8 @@ test("bind_carray slices float vectors", function ()
   stmt:bind_carray(1, v, 1, 2)
   local got = drain(stmt)
   assert(eq(#got, 2))
-  assert(math.abs(got[1] - 2.5) < 1e-6)
-  assert(math.abs(got[2] - 3.5) < 1e-6)
+  assert(num.abs(got[1] - 2.5) < 1e-6)
+  assert(num.abs(got[2] - 3.5) < 1e-6)
 end)
 
 test("bind_carray rejects an out-of-range slice", function ()

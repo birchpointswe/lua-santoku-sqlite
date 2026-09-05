@@ -15,6 +15,9 @@ local sqlite = require("santoku.sqlite.db")
 local sql = require("santoku.sqlite")
 
 local arr = require("santoku.array")
+local fs = require("santoku.fs")
+local utc = require("santoku.utc")
+local random = require("santoku.random")
 local icollect = arr.icollect
 
 test("should wrap various functions", function ()
@@ -183,8 +186,8 @@ end)
 
 test("persists to a file across open and close", function ()
   local path = "tk_sqlite_test_" ..
-    tostring(os.time()) .. "_" .. tostring(math.random(1, 1000000)) .. ".db"
-  os.remove(path)
+    tostring(utc.time()) .. "_" .. tostring(random.num(1, 1000000)) .. ".db"
+  fs.rm(path, true)
   local d1 = sql(sqlite.open(path))
   d1.exec("create table t (n)")
   d1.runner("insert into t (n) values (?)")(42)
@@ -192,7 +195,7 @@ test("persists to a file across open and close", function ()
   local d2 = sql(sqlite.open(path))
   assert(eq(d2.getter("select n from t")(), 42))
   d2.close()
-  os.remove(path)
+  fs.rm(path, true)
 end)
 
 test("manual begin/commit and begin/rollback", function ()
