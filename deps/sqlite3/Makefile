@@ -3,7 +3,8 @@ SQLITE_DIR := sqlite-amalgamation-$(SQLITE_VERSION)
 
 # Kept: json, subqueries, CTEs, cast, like/glob, collate, datetime, compound
 # select, FTS, pragmas, case expressions, returning, upsert, foreign keys,
-# complete, authorizer.
+# complete, authorizer, explain, generated columns, progress callback,
+# integrity_check.
 # Parser-referenced (can't omit): view, trigger, windowfunc, attach, detach,
 # vacuum, reindex, analyze, altertable.
 
@@ -14,19 +15,15 @@ SQLITE_CFLAGS := \
   -DSQLITE_OMIT_SHARED_CACHE \
   -DSQLITE_OMIT_DEPRECATED \
   -DSQLITE_OMIT_GET_TABLE \
-  -DSQLITE_OMIT_PROGRESS_CALLBACK \
   -DSQLITE_OMIT_TRACE \
   -DSQLITE_OMIT_UTF16 \
   -DSQLITE_OMIT_TCL_VARIABLE \
   -DSQLITE_OMIT_DECLTYPE \
   -DSQLITE_OMIT_AUTOINIT \
-  -DSQLITE_OMIT_EXPLAIN \
   -DSQLITE_OMIT_COMPILEOPTION_DIAGS \
-  -DSQLITE_OMIT_INTEGRITY_CHECK \
   -DSQLITE_OMIT_SCHEMA_VERSION_PRAGMAS \
   -DSQLITE_OMIT_AUTOINCREMENT \
   -DSQLITE_OMIT_INCRBLOB \
-  -DSQLITE_OMIT_GENERATED_COLUMNS \
   -DSQLITE_OMIT_BLOB_LITERAL \
   -DSQLITE_OMIT_INTROSPECTION_PRAGMAS \
   -DSQLITE_OMIT_LOOKASIDE \
