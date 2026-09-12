@@ -216,3 +216,70 @@ test("manual begin/commit and begin/rollback", function ()
   assert(eq(count(), 2))
   db.close()
 end)
+
+test("complete detects statement boundaries", function ()
+  assert(eq(sqlite.complete("select 1;"), true))
+  assert(eq(sqlite.complete("select 1"), false))
+  assert(eq(sqlite.complete("insert into t values (';');"), true))
+  assert(eq(sqlite.complete(
+    "create trigger tr after insert on t begin select 1;"), false))
+  assert(eq(sqlite.complete(
+    "create trigger tr after insert on t begin select 1; end;"), true))
+end)
+
+test("query returns rows and column names for ad-hoc sql", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (a integer, b text)")
+  local add = db.runner("insert into t (a, b) values (?, ?)")
+  add(1, "x")
+  add(2, "y")
+  local rows, cols = db.query("select a, b from t order by a")
+  assert(teq(cols, { "a", "b" }))
+  assert(teq(rows, { { 1, "x" }, { 2, "y" } }))
+  local rows2, cols2 = db.query("select b from t where a = ?", 2)
+  assert(teq(cols2, { "b" }))
+  assert(teq(rows2, { { "y" } }))
+  local rows3, cols3 = db.query("select a from t where a > 100")
+  assert(teq(cols3, { "a" }))
+  assert(teq(rows3, {}))
+  assert(eq(pcall(function () db.query("select nope from t") end), false))
+end)
+
+test("authorizer denies and detects", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (n integer)")
+  local seen = {}
+  db.authorizer(function (code, a)
+    seen[#seen + 1] = { code, a }
+    if code == sqlite.ATTACH then
+      return false
+    end
+    return true
+  end)
+  assert(eq(pcall(function () db.query("attach ':memory:' as other") end), false))
+  db.query("select n from t")
+  local saw_attach = false
+  local saw_read = false
+  for i = 1, #seen do
+    if seen[i][1] == sqlite.ATTACH then saw_attach = true end
+    if seen[i][1] == sqlite.READ and seen[i][2] == "t" then saw_read = true end
+  end
+  assert(eq(saw_attach, true))
+  assert(eq(saw_read, true))
+  local ddl = {}
+  db.authorizer(function (code, a)
+    if code == sqlite.CREATE_TABLE or code == sqlite.DROP_TABLE
+      or code == sqlite.ALTER_TABLE or code == sqlite.CREATE_VIEW
+      or code == sqlite.DROP_VIEW then
+      ddl[#ddl + 1] = { code, a }
+    end
+    return true
+  end)
+  db.exec("create table u (m integer)")
+  assert(eq(#ddl, 1))
+  assert(eq(ddl[1][1], sqlite.CREATE_TABLE))
+  assert(eq(ddl[1][2], "u"))
+  db.authorizer(nil)
+  db.query("attach ':memory:' as other2")
+  db.close()
+end)

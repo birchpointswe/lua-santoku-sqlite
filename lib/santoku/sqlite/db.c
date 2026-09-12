@@ -20,6 +20,8 @@ typedef struct {
   sqlite3 *handle;
   tk_sqlite_stmt *stmts;
   char *enc_path;
+  lua_State *auth_L;
+  int auth_ref;
 } tk_sqlite_db;
 
 static void db_release_key (tk_sqlite_db *db) {
@@ -59,6 +61,43 @@ static void stmt_link (tk_sqlite_db *db, tk_sqlite_stmt *s) {
 
 static tk_sqlite_db *check_db (lua_State *L, int idx) {
   return (tk_sqlite_db *) luaL_checkudata(L, idx, TK_SQLITE_DB_MT);
+}
+
+static void db_auth_clear (lua_State *L, tk_sqlite_db *db) {
+  if (db->auth_ref != LUA_NOREF) {
+    luaL_unref(L, LUA_REGISTRYINDEX, db->auth_ref);
+    db->auth_ref = LUA_NOREF;
+  }
+  db->auth_L = NULL;
+  if (db->handle)
+    sqlite3_set_authorizer(db->handle, NULL, NULL);
+}
+
+static int db_auth_cb (void *ud, int code, const char *a, const char *b,
+                       const char *c, const char *d) {
+  tk_sqlite_db *db = (tk_sqlite_db *) ud;
+  lua_State *L = db->auth_L;
+  if (!L || db->auth_ref == LUA_NOREF)
+    return SQLITE_OK;
+  if (!lua_checkstack(L, 8))
+    return SQLITE_DENY;
+  lua_rawgeti(L, LUA_REGISTRYINDEX, db->auth_ref);
+  lua_pushinteger(L, code);
+  if (a) lua_pushstring(L, a); else lua_pushnil(L);
+  if (b) lua_pushstring(L, b); else lua_pushnil(L);
+  if (c) lua_pushstring(L, c); else lua_pushnil(L);
+  if (d) lua_pushstring(L, d); else lua_pushnil(L);
+  if (lua_pcall(L, 5, 1, 0) != 0) {
+    lua_pop(L, 1);
+    return SQLITE_DENY;
+  }
+  int rc = SQLITE_OK;
+  if (lua_type(L, -1) == LUA_TNUMBER)
+    rc = (int) lua_tointeger(L, -1);
+  else if (lua_type(L, -1) == LUA_TBOOLEAN && !lua_toboolean(L, -1))
+    rc = SQLITE_DENY;
+  lua_pop(L, 1);
+  return rc;
 }
 
 static tk_sqlite_stmt *check_stmt (lua_State *L, int idx) {
@@ -107,6 +146,7 @@ static int db_close (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
   int rc = SQLITE_OK;
   if (db->handle) {
+    db_auth_clear(L, db);
     rc = sqlite3_close(db->handle);
     if (rc == SQLITE_OK) {
       db->handle = NULL;
@@ -115,6 +155,19 @@ static int db_close (lua_State *L) {
   }
   lua_pushinteger(L, rc);
   return 1;
+}
+
+static int db_authorizer (lua_State *L) {
+  tk_sqlite_db *db = check_db(L, 1);
+  db_auth_clear(L, db);
+  if (lua_isnoneornil(L, 2))
+    return 0;
+  luaL_checktype(L, 2, LUA_TFUNCTION);
+  lua_pushvalue(L, 2);
+  db->auth_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  db->auth_L = L;
+  sqlite3_set_authorizer(db->handle, db_auth_cb, db);
+  return 0;
 }
 
 static int db_close_vm (lua_State *L) {
@@ -151,6 +204,7 @@ static int db_reset_cache (lua_State *L) {
 
 static int db_gc (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
+  db_auth_clear(L, db);
   if (db->handle) {
     while (db->stmts) {
       tk_sqlite_stmt *s = db->stmts;
@@ -498,6 +552,29 @@ static int stmt_columns (lua_State *L) {
   return 1;
 }
 
+static int stmt_column_names (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  int n = sqlite3_column_count(s->handle);
+  lua_createtable(L, n, 0);
+  for (int i = 0; i < n; i++) {
+    const char *name = sqlite3_column_name(s->handle, i);
+    lua_pushstring(L, name ? name : "");
+    lua_rawseti(L, -2, i + 1);
+  }
+  return 1;
+}
+
+static int stmt_get_values (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  int n = sqlite3_column_count(s->handle);
+  lua_createtable(L, n, 0);
+  for (int i = 0; i < n; i++) {
+    push_column(L, s->handle, i);
+    lua_rawseti(L, -2, i + 1);
+  }
+  return 1;
+}
+
 static int stmt_gc (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
   if (s->handle) {
@@ -517,6 +594,7 @@ static luaL_Reg db_methods[] = {
   { "close_vm", db_close_vm },
   { "last_insert_rowid", db_last_insert_rowid },
   { "reset_cache", db_reset_cache },
+  { "authorizer", db_authorizer },
   { NULL, NULL }
 };
 
@@ -528,6 +606,8 @@ static luaL_Reg stmt_methods[] = {
   { "get_value", stmt_get_value },
   { "get_named_values", stmt_get_named_values },
   { "columns", stmt_columns },
+  { "column_names", stmt_column_names },
+  { "get_values", stmt_get_values },
   { "bind_carray", stmt_bind_carray },
   { NULL, NULL }
 };
@@ -553,8 +633,17 @@ static int push_db (lua_State *L, sqlite3 *raw) {
   db->handle = raw;
   db->stmts = NULL;
   db->enc_path = NULL;
+  db->auth_L = NULL;
+  db->auth_ref = LUA_NOREF;
   luaL_getmetatable(L, TK_SQLITE_DB_MT);
   lua_setmetatable(L, -2);
+  return 1;
+}
+
+static int tk_complete (lua_State *L) {
+  const char *sql = luaL_checkstring(L, 1);
+  sqlite3_initialize();
+  lua_pushboolean(L, sqlite3_complete(sql));
   return 1;
 }
 
@@ -805,6 +894,23 @@ EM_JS(void, tk_sah_setup, (), {
     return false;
   }
 
+  async function adopt_slots () {
+    if (!C.opaqueHandle) return;
+    var used = {};
+    for (var i = 0; i < C.files.length; i++) used[C.files[i].name] = true;
+    var fresh = [];
+    for await (var entry of C.opaqueHandle.values()) {
+      if (entry.kind === "file" && !used[entry.name]) fresh.push(entry.name);
+    }
+    fresh.sort();
+    for (var i = 0; i < fresh.length; i++) {
+      var fh = await C.opaqueHandle.getFileHandle(fresh[i]);
+      var sah = await fh.createSyncAccessHandle({ mode: "readwrite-unsafe" });
+      C.files.push({ name: fresh[i], fh: fh, sah: sah, path: "", flags: 0, dirty: false });
+    }
+    C.capacity = C.files.length;
+  }
+
   globalThis.__tk_coop_init = async function (dir, capacity) {
     var root = await navigator.storage.getDirectory();
     C.dirHandle = await root.getDirectoryHandle(dir, { create: true });
@@ -839,11 +945,31 @@ EM_JS(void, tk_sah_setup, (), {
     C.capacity = C.files.length;
   };
 
+  globalThis.__tk_coop_grow = async function (n) {
+    var used = {};
+    for (var i = 0; i < C.files.length; i++) used[C.files[i].name] = true;
+    var idx = 0;
+    var added = 0;
+    while (added < n) {
+      var name = String(idx).padStart(8, "0");
+      idx++;
+      if (used[name]) continue;
+      var fh = await C.opaqueHandle.getFileHandle(name, { create: true });
+      var sah = await fh.createSyncAccessHandle({ mode: "readwrite-unsafe" });
+      C.files.push({ name: name, fh: fh, sah: sah, path: "", flags: 0, dirty: false });
+      used[name] = true;
+      added++;
+    }
+    C.capacity = C.files.length;
+    return C.capacity;
+  };
+
   globalThis.__tk_coop_acquire = function () {
     if (C.held) return Promise.resolve();
     if (C.acquiring) return C.acquiring;
     C.acquiring = new Promise(function (resolve, reject) {
-      navigator.locks.request(C.lockName, { mode: "exclusive" }, function () {
+      navigator.locks.request(C.lockName, { mode: "exclusive" }, async function () {
+        await adopt_slots();
         rescan();
         var cur = db_counters();
         if (counters_changed(C.counters, cur)) {
@@ -1228,6 +1354,50 @@ int luaopen_santoku_sqlite_db (lua_State *L) {
   lua_setfield(L, -2, "key_clear");
   lua_pushcfunction(L, tk_enc_vfs_name);
   lua_setfield(L, -2, "enc_vfs");
+  lua_pushcfunction(L, tk_complete);
+  lua_setfield(L, -2, "complete");
+  struct { const char *name; int value; } auth_consts[] = {
+    { "DENY", SQLITE_DENY },
+    { "IGNORE", SQLITE_IGNORE },
+    { "CREATE_INDEX", SQLITE_CREATE_INDEX },
+    { "CREATE_TABLE", SQLITE_CREATE_TABLE },
+    { "CREATE_TEMP_INDEX", SQLITE_CREATE_TEMP_INDEX },
+    { "CREATE_TEMP_TABLE", SQLITE_CREATE_TEMP_TABLE },
+    { "CREATE_TEMP_TRIGGER", SQLITE_CREATE_TEMP_TRIGGER },
+    { "CREATE_TEMP_VIEW", SQLITE_CREATE_TEMP_VIEW },
+    { "CREATE_TRIGGER", SQLITE_CREATE_TRIGGER },
+    { "CREATE_VIEW", SQLITE_CREATE_VIEW },
+    { "DELETE", SQLITE_DELETE },
+    { "DROP_INDEX", SQLITE_DROP_INDEX },
+    { "DROP_TABLE", SQLITE_DROP_TABLE },
+    { "DROP_TEMP_INDEX", SQLITE_DROP_TEMP_INDEX },
+    { "DROP_TEMP_TABLE", SQLITE_DROP_TEMP_TABLE },
+    { "DROP_TEMP_TRIGGER", SQLITE_DROP_TEMP_TRIGGER },
+    { "DROP_TEMP_VIEW", SQLITE_DROP_TEMP_VIEW },
+    { "DROP_TRIGGER", SQLITE_DROP_TRIGGER },
+    { "DROP_VIEW", SQLITE_DROP_VIEW },
+    { "INSERT", SQLITE_INSERT },
+    { "PRAGMA", SQLITE_PRAGMA },
+    { "READ", SQLITE_READ },
+    { "SELECT", SQLITE_SELECT },
+    { "TRANSACTION", SQLITE_TRANSACTION },
+    { "UPDATE", SQLITE_UPDATE },
+    { "ATTACH", SQLITE_ATTACH },
+    { "DETACH", SQLITE_DETACH },
+    { "ALTER_TABLE", SQLITE_ALTER_TABLE },
+    { "REINDEX", SQLITE_REINDEX },
+    { "ANALYZE", SQLITE_ANALYZE },
+    { "CREATE_VTABLE", SQLITE_CREATE_VTABLE },
+    { "DROP_VTABLE", SQLITE_DROP_VTABLE },
+    { "FUNCTION", SQLITE_FUNCTION },
+    { "SAVEPOINT", SQLITE_SAVEPOINT },
+    { "RECURSIVE", SQLITE_RECURSIVE },
+    { NULL, 0 }
+  };
+  for (int i = 0; auth_consts[i].name; i++) {
+    lua_pushinteger(L, auth_consts[i].value);
+    lua_setfield(L, -2, auth_consts[i].name);
+  }
 #ifdef __EMSCRIPTEN__
   lua_pushboolean(L, 1);
 #else

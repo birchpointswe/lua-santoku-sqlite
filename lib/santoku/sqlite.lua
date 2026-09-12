@@ -77,7 +77,6 @@ local function run (db, stmt, prop, out, ...)
   end
 end
 
-
 local function query (db, stmt, prop, ...)
   reset(db, stmt)
   bind(stmt, ...)
@@ -93,6 +92,24 @@ local function query (db, stmt, prop, ...)
       end
     elseif res == DONE then
       return reset(db, stmt)
+    else
+      reset(db, stmt)
+      return error(db:errmsg(), db:errcode())
+    end
+  end
+end
+
+local function rows_of (db, stmt, ...)
+  bind(stmt, ...)
+  local names = stmt:column_names()
+  local out = {}
+  while true do
+    local res = stmt:step()
+    if res == ROW then
+      out[#out + 1] = stmt:get_values()
+    elseif res == DONE then
+      reset(db, stmt)
+      return out, names
     else
       reset(db, stmt)
       return error(db:errmsg(), db:errcode())
@@ -245,6 +262,15 @@ local function wrap (...)
           return db:last_insert_rowid()
         end
       end)
+    end,
+
+    query = function (sql, ...)
+      local stmt = check(db, db:prepare(sql), "error in query")
+      return rows_of(db, stmt, ...)
+    end,
+
+    authorizer = function (fn)
+      return db:authorizer(fn)
     end,
 
   }

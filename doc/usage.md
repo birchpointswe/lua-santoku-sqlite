@@ -207,6 +207,41 @@ idx.clear("u1")                                 -- isolated from u2
 Anchor: `test/spec/santoku/sqlite/search.lua` (all five scenarios above plus the
 transaction-rollback case).
 
+## Ad-hoc SQL: query, complete, authorizer
+
+The factories assume SQL known at startup, prepared once and reused. For SQL that
+arrives at runtime, `db.query` prepares fresh per call and returns materialized rows
+plus column names:
+
+```lua
+local rows, cols = db.query("select a, b from t order by a")
+-- cols == { "a", "b" }, rows == { { 1, "x" }, { 2, "y" } }
+local rows2 = db.query("select b from t where a = ?", 2)
+```
+
+`sqlite.complete(str)` reports whether a string is one or more complete statements,
+for splitting editor input (semicolons inside trigger bodies do not fool it):
+
+```lua
+sqlite.complete("select 1;")                      -- true
+sqlite.complete("select 1")                       -- false
+```
+
+`db.authorizer(fn)` installs a compile-time hook called per action during prepare.
+Return `true`/`nil` to allow, `false` to deny, or a code (`sqlite.DENY`,
+`sqlite.IGNORE`) verbatim. Action codes are on the module (`sqlite.ATTACH`,
+`sqlite.CREATE_TABLE`, `sqlite.READ`, ...); `db.authorizer(nil)` uninstalls. An
+error raised inside the callback denies.
+
+```lua
+db.authorizer(function (code)
+  return code ~= sqlite.ATTACH
+end)
+```
+
+Anchor: `test/spec/santoku/sqlite/db.lua` ("complete detects statement boundaries",
+"query returns rows and column names for ad-hoc sql", "authorizer denies and detects").
+
 ## Gotchas
 
 - The factories return a closure; `iter`/`all` need a second call to bind and run. Reuse

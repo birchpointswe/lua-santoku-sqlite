@@ -2,7 +2,8 @@ SQLITE_VERSION := 3490200
 SQLITE_DIR := sqlite-amalgamation-$(SQLITE_VERSION)
 
 # Kept: json, subqueries, CTEs, cast, like/glob, collate, datetime, compound
-# select, FTS, pragmas, case expressions, returning, upsert, foreign keys.
+# select, FTS, pragmas, case expressions, returning, upsert, foreign keys,
+# complete, authorizer.
 # Parser-referenced (can't omit): view, trigger, windowfunc, attach, detach,
 # vacuum, reindex, analyze, altertable.
 
@@ -11,13 +12,11 @@ SQLITE_CFLAGS := \
   -DSQLITE_THREADSAFE=0 \
   -DSQLITE_OMIT_LOAD_EXTENSION \
   -DSQLITE_OMIT_SHARED_CACHE \
-  -DSQLITE_OMIT_AUTHORIZATION \
   -DSQLITE_OMIT_DEPRECATED \
   -DSQLITE_OMIT_GET_TABLE \
   -DSQLITE_OMIT_PROGRESS_CALLBACK \
   -DSQLITE_OMIT_TRACE \
   -DSQLITE_OMIT_UTF16 \
-  -DSQLITE_OMIT_COMPLETE \
   -DSQLITE_OMIT_TCL_VARIABLE \
   -DSQLITE_OMIT_DECLTYPE \
   -DSQLITE_OMIT_AUTOINIT \
@@ -37,7 +36,7 @@ SQLITE_CFLAGS := \
   -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
   -DSQLITE_ENABLE_JSON1 \
   -DSQLITE_ENABLE_MATH_FUNCTIONS \
-  -DSQLITE_MAX_EXPR_DEPTH=0
+  -DSQLITE_MAX_EXPR_DEPTH=1000
 
 results.mk:
 	[ -f sqlite-amalgamation-$(SQLITE_VERSION).zip ] || { echo "missing vendored sqlite-amalgamation-$(SQLITE_VERSION).zip; run 'toku vendor'" >&2; exit 1; }
