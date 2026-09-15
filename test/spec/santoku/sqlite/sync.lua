@@ -781,7 +781,7 @@ test("sqlite.sync", function ()
     end
     assert(bad({ tables = {} }))
     assert(bad({ tables = { notes = { pk = {}, columns = { "title" } } } }))
-    assert(bad({ tables = { notes = { pk = { "id" }, columns = {} } } }))
+    assert(bad({ tables = { notes = { pk = { "id" } } } }))
     assert(bad({ tables = { notes = { pk = { "id" }, columns = { "id" } } } }))
     assert(bad({ tables = { notes = { pk = { "id" }, columns = { "hlc" } } } }))
     assert(bad({ tables = { notes = { pk = { "id" }, columns = { "title" }, granularity = "wat" } } }))
@@ -790,6 +790,58 @@ test("sqlite.sync", function ()
       tables = { notes = { pk = { "id" }, columns = { "title" } } },
       codec = { enc = function () end, dec = function () end },
     }))
+  end)
+
+  test("pk-only tables sync on row existence", function ()
+    local function jpeer (seed_rows)
+      local db = sql(sqlite.open_memory())
+      db.exec("create table m (a text not null, b text not null, primary key (a, b))")
+      local add = db.runner("insert into m (a, b) values (?1, ?2)")
+      for _, r in ipairs(seed_rows or {}) do add(r[1], r[2]) end
+      local s = sync.create(db, {
+        space = "j",
+        tables = { m = { pk = { "a", "b" }, columns = {} } },
+      })
+      return {
+        db = db,
+        sync = s,
+        add = add,
+        drop = db.runner("delete from m where a = ?1 and b = ?2"),
+        count = db.getter("select count(*) from m"),
+        has = db.getter("select count(*) from m where a = ?1 and b = ?2"),
+      }
+    end
+    local a = jpeer()
+    local b = jpeer()
+    a.add("t1", "i1")
+    a.add("t1", "i2")
+    assert(eq(pull(b, a).applied, 2))
+    assert(eq(b.count(), 2))
+    b.drop("t1", "i2")
+    b.add("t2", "i1")
+    pull(a, b)
+    assert(eq(a.count(), 2))
+    assert(eq(a.has("t1", "i2"), 0))
+    assert(eq(a.has("t2", "i1"), 1))
+    pull(a, b)
+    pull(b, a)
+    assert(eq(a.count(), b.count()))
+    local c = jpeer({ { "t9", "i9" } })
+    pull(c, a)
+    assert(eq(c.count(), 3))
+    pull(a, c)
+    assert(eq(a.count(), 3))
+    assert(eq(a.has("t9", "i9"), 1))
+  end)
+
+  test("column granularity refuses empty columns", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("create table m (a text primary key)")
+    local ok = pcall(sync.create, db, {
+      space = "x",
+      tables = { m = { pk = { "a" }, columns = {}, granularity = "column" } },
+    })
+    assert(eq(ok, false))
   end)
 
 end)

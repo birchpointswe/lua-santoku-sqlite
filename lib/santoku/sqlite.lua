@@ -273,6 +273,10 @@ local function wrap (...)
       return db:authorizer(fn)
     end,
 
+    progress = function (n, fn)
+      return db:progress(n, fn)
+    end,
+
   }
 end
 

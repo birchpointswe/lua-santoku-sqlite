@@ -22,6 +22,8 @@ typedef struct {
   char *enc_path;
   lua_State *auth_L;
   int auth_ref;
+  lua_State *prog_L;
+  int prog_ref;
 } tk_sqlite_db;
 
 static void db_release_key (tk_sqlite_db *db) {
@@ -71,6 +73,33 @@ static void db_auth_clear (lua_State *L, tk_sqlite_db *db) {
   db->auth_L = NULL;
   if (db->handle)
     sqlite3_set_authorizer(db->handle, NULL, NULL);
+}
+
+static void db_prog_clear (lua_State *L, tk_sqlite_db *db) {
+  if (db->prog_ref != LUA_NOREF) {
+    luaL_unref(L, LUA_REGISTRYINDEX, db->prog_ref);
+    db->prog_ref = LUA_NOREF;
+  }
+  db->prog_L = NULL;
+  if (db->handle)
+    sqlite3_progress_handler(db->handle, 0, NULL, NULL);
+}
+
+static int db_prog_cb (void *ud) {
+  tk_sqlite_db *db = (tk_sqlite_db *) ud;
+  lua_State *L = db->prog_L;
+  if (!L || db->prog_ref == LUA_NOREF)
+    return 0;
+  if (!lua_checkstack(L, 2))
+    return 1;
+  lua_rawgeti(L, LUA_REGISTRYINDEX, db->prog_ref);
+  if (lua_pcall(L, 0, 1, 0) != 0) {
+    lua_pop(L, 1);
+    return 1;
+  }
+  int rc = lua_toboolean(L, -1) ? 1 : 0;
+  lua_pop(L, 1);
+  return rc;
 }
 
 static int db_auth_cb (void *ud, int code, const char *a, const char *b,
@@ -147,6 +176,7 @@ static int db_close (lua_State *L) {
   int rc = SQLITE_OK;
   if (db->handle) {
     db_auth_clear(L, db);
+    db_prog_clear(L, db);
     rc = sqlite3_close(db->handle);
     if (rc == SQLITE_OK) {
       db->handle = NULL;
@@ -167,6 +197,20 @@ static int db_authorizer (lua_State *L) {
   db->auth_ref = luaL_ref(L, LUA_REGISTRYINDEX);
   db->auth_L = L;
   sqlite3_set_authorizer(db->handle, db_auth_cb, db);
+  return 0;
+}
+
+static int db_progress (lua_State *L) {
+  tk_sqlite_db *db = check_db(L, 1);
+  db_prog_clear(L, db);
+  if (lua_isnoneornil(L, 2))
+    return 0;
+  int n = (int) luaL_checkinteger(L, 2);
+  luaL_checktype(L, 3, LUA_TFUNCTION);
+  lua_pushvalue(L, 3);
+  db->prog_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  db->prog_L = L;
+  sqlite3_progress_handler(db->handle, n > 0 ? n : 1, db_prog_cb, db);
   return 0;
 }
 
@@ -205,6 +249,7 @@ static int db_reset_cache (lua_State *L) {
 static int db_gc (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
   db_auth_clear(L, db);
+  db_prog_clear(L, db);
   if (db->handle) {
     while (db->stmts) {
       tk_sqlite_stmt *s = db->stmts;
@@ -595,6 +640,7 @@ static luaL_Reg db_methods[] = {
   { "last_insert_rowid", db_last_insert_rowid },
   { "reset_cache", db_reset_cache },
   { "authorizer", db_authorizer },
+  { "progress", db_progress },
   { NULL, NULL }
 };
 
@@ -635,6 +681,8 @@ static int push_db (lua_State *L, sqlite3 *raw) {
   db->enc_path = NULL;
   db->auth_L = NULL;
   db->auth_ref = LUA_NOREF;
+  db->prog_L = NULL;
+  db->prog_ref = LUA_NOREF;
   luaL_getmetatable(L, TK_SQLITE_DB_MT);
   lua_setmetatable(L, -2);
   return 1;

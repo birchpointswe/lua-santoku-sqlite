@@ -239,8 +239,22 @@ db.authorizer(function (code)
 end)
 ```
 
+`db.progress(n, fn)` installs a VDBE progress handler called every `n` steps; return
+truthy to interrupt the running statement (it errors with "interrupted"). An error
+raised inside the callback also interrupts. `db.progress(nil)` uninstalls. Use it as a
+step budget so a runaway query errors instead of hanging:
+
+```lua
+local steps = 0
+db.progress(1000, function ()
+  steps = steps + 1
+  return steps > 10000
+end)
+```
+
 Anchor: `test/spec/santoku/sqlite/db.lua` ("complete detects statement boundaries",
-"query returns rows and column names for ad-hoc sql", "authorizer denies and detects").
+"query returns rows and column names for ad-hoc sql", "authorizer denies and detects",
+"progress budget interrupts a runaway query").
 
 ## Gotchas
 

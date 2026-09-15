@@ -245,6 +245,25 @@ test("query returns rows and column names for ad-hoc sql", function ()
   assert(eq(pcall(function () db.query("select nope from t") end), false))
 end)
 
+test("progress budget interrupts a runaway query", function ()
+  local db = sql(sqlite.open_memory())
+  local calls = 0
+  db.progress(100, function ()
+    calls = calls + 1
+    return calls > 3
+  end)
+  local ok = pcall(function ()
+    return db.query(
+      "with recursive c(x) as (select 1 union all select x + 1 from c) select max(x) from c")
+  end)
+  assert(eq(ok, false))
+  assert(eq(calls > 3, true))
+  db.progress(nil)
+  local rows = db.query("select 1")
+  assert(eq(rows[1][1], 1))
+  db.close()
+end)
+
 test("authorizer denies and detects", function ()
   local db = sql(sqlite.open_memory())
   db.exec("create table t (n integer)")

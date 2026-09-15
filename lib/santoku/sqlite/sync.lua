@@ -95,10 +95,12 @@ local function create (db, opts)
     local pk = spec.pk
     assert(type(pk) == "table" and #pk > 0, "sync.create: " .. name .. " needs a non-empty pk")
     local cols = spec.columns
-    assert(type(cols) == "table" and #cols > 0, "sync.create: " .. name .. " needs non-empty columns")
+    assert(type(cols) == "table", "sync.create: " .. name .. " needs a columns table")
     local gran = spec.granularity or "row"
     assert(gran == "row" or gran == "column",
       "sync.create: " .. name .. " granularity must be row or column")
+    assert(gran == "row" or #cols > 0,
+      "sync.create: " .. name .. " column granularity needs non-empty columns")
     local version = spec.version or 1
     assert(type(version) == "number" and version >= 1,
       "sync.create: " .. name .. " version must be >= 1")
@@ -375,7 +377,9 @@ local function create (db, opts)
     local upsert_base = db.runner(
       "insert into " .. base .. " (" .. arr.concat(all_cols, ", ") .. ") values (" ..
       arr.concat(ph, ", ") .. ") on conflict (" .. arr.concat(spec.pk, ", ") ..
-      ") do update set " .. arr.concat(setters, ", "))
+      (#setters > 0
+        and (") do update set " .. arr.concat(setters, ", "))
+        or ") do nothing"))
 
     local col_set = {}
     if column then
