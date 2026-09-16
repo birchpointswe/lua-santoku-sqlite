@@ -16,14 +16,22 @@
 
 typedef struct tk_sqlite_stmt tk_sqlite_stmt;
 
+#define TK_AUTH_NCODES 64
+
+typedef struct {
+  unsigned char deny[TK_AUTH_NCODES];
+  char **pragmas;
+  size_t n_pragmas;
+} tk_auth_policy;
+
 typedef struct {
   sqlite3 *handle;
   tk_sqlite_stmt *stmts;
   char *enc_path;
-  lua_State *auth_L;
-  int auth_ref;
-  lua_State *prog_L;
-  int prog_ref;
+  tk_auth_policy *auth;
+  int busy;
+  int prog_budget;
+  int prog_ticks;
 } tk_sqlite_db;
 
 static void db_release_key (tk_sqlite_db *db) {
@@ -65,78 +73,237 @@ static tk_sqlite_db *check_db (lua_State *L, int idx) {
   return (tk_sqlite_db *) luaL_checkudata(L, idx, TK_SQLITE_DB_MT);
 }
 
-static void db_auth_clear (lua_State *L, tk_sqlite_db *db) {
-  if (db->auth_ref != LUA_NOREF) {
-    luaL_unref(L, LUA_REGISTRYINDEX, db->auth_ref);
-    db->auth_ref = LUA_NOREF;
-  }
-  db->auth_L = NULL;
-  if (db->handle)
-    sqlite3_set_authorizer(db->handle, NULL, NULL);
+static sqlite3 *db_handle (lua_State *L, tk_sqlite_db *db, const char *what) {
+  if (!db->handle)
+    luaL_error(L, "%s: database is closed", what);
+  return db->handle;
 }
 
-static void db_prog_clear (lua_State *L, tk_sqlite_db *db) {
-  if (db->prog_ref != LUA_NOREF) {
-    luaL_unref(L, LUA_REGISTRYINDEX, db->prog_ref);
-    db->prog_ref = LUA_NOREF;
-  }
-  db->prog_L = NULL;
+static void db_check_idle (lua_State *L, tk_sqlite_db *db, const char *what) {
+  if (db->busy)
+    luaL_error(L, "%s: not allowed while the database is executing", what);
+}
+
+static void db_auth_policy_free (tk_auth_policy *p) {
+  if (!p)
+    return;
+  for (size_t i = 0; i < p->n_pragmas; i++)
+    free(p->pragmas[i]);
+  free(p->pragmas);
+  free(p);
+}
+
+static void db_auth_clear (tk_sqlite_db *db) {
+  if (db->handle)
+    sqlite3_set_authorizer(db->handle, NULL, NULL);
+  db_auth_policy_free(db->auth);
+  db->auth = NULL;
+}
+
+static void db_prog_clear (tk_sqlite_db *db) {
   if (db->handle)
     sqlite3_progress_handler(db->handle, 0, NULL, NULL);
+  db->prog_budget = 0;
+  db->prog_ticks = 0;
 }
 
 static int db_prog_cb (void *ud) {
   tk_sqlite_db *db = (tk_sqlite_db *) ud;
-  lua_State *L = db->prog_L;
-  if (!L || db->prog_ref == LUA_NOREF)
-    return 0;
-  if (!lua_checkstack(L, 2))
+  if (db->prog_ticks >= db->prog_budget)
     return 1;
-  lua_rawgeti(L, LUA_REGISTRYINDEX, db->prog_ref);
-  if (lua_pcall(L, 0, 1, 0) != 0) {
-    lua_pop(L, 1);
-    return 1;
+  db->prog_ticks++;
+  return 0;
+}
+
+static int tk_auth_lower (int c) {
+  return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+static int tk_auth_cmp_ci (const char *stored, const char *raw) {
+  for (size_t i = 0; ; i++) {
+    unsigned char x = (unsigned char) stored[i];
+    unsigned char y = (unsigned char) tk_auth_lower((unsigned char) raw[i]);
+    if (x != y)
+      return x < y ? -1 : 1;
+    if (x == 0)
+      return 0;
   }
-  int rc = lua_toboolean(L, -1) ? 1 : 0;
-  lua_pop(L, 1);
-  return rc;
+}
+
+static int tk_auth_sort_cmp (const void *x, const void *y) {
+  return strcmp(*(const char *const *) x, *(const char *const *) y);
+}
+
+static int db_auth_pragma_ok (tk_auth_policy *p, const char *name) {
+  if (!name || !p->pragmas)
+    return 0;
+  size_t lo = 0, hi = p->n_pragmas;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = tk_auth_cmp_ci(p->pragmas[mid], name);
+    if (c == 0)
+      return 1;
+    if (c < 0)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return 0;
 }
 
 static int db_auth_cb (void *ud, int code, const char *a, const char *b,
                        const char *c, const char *d) {
+  (void) b; (void) c; (void) d;
   tk_sqlite_db *db = (tk_sqlite_db *) ud;
-  lua_State *L = db->auth_L;
-  if (!L || db->auth_ref == LUA_NOREF)
-    return SQLITE_OK;
-  if (!lua_checkstack(L, 8))
+  tk_auth_policy *p = db ? db->auth : NULL;
+  if (!p)
     return SQLITE_DENY;
-  lua_rawgeti(L, LUA_REGISTRYINDEX, db->auth_ref);
-  lua_pushinteger(L, code);
-  if (a) lua_pushstring(L, a); else lua_pushnil(L);
-  if (b) lua_pushstring(L, b); else lua_pushnil(L);
-  if (c) lua_pushstring(L, c); else lua_pushnil(L);
-  if (d) lua_pushstring(L, d); else lua_pushnil(L);
-  if (lua_pcall(L, 5, 1, 0) != 0) {
+  if (code < 0 || code >= TK_AUTH_NCODES)
+    return SQLITE_DENY;
+  if (p->deny[code])
+    return SQLITE_DENY;
+  if (code == SQLITE_PRAGMA)
+    return db_auth_pragma_ok(p, a) ? SQLITE_OK : SQLITE_DENY;
+  return SQLITE_OK;
+}
+
+static char *tk_auth_dup_lower (const char *s, size_t n) {
+  char *out = (char *) malloc(n + 1);
+  if (!out)
+    return NULL;
+  for (size_t i = 0; i < n; i++)
+    out[i] = (char) tk_auth_lower((unsigned char) s[i]);
+  out[n] = '\0';
+  return out;
+}
+
+static int db_auth_field (lua_State *L, int idx, const char *key, const char **err) {
+  lua_pushstring(L, key);
+  lua_rawget(L, idx);
+  if (lua_isnil(L, -1))
+    return 0;
+  if (lua_type(L, -1) != LUA_TTABLE) {
     lua_pop(L, 1);
-    return SQLITE_DENY;
+    *err = "deny and pragmas must be arrays";
+    return -1;
   }
-  int rc = SQLITE_OK;
-  if (lua_type(L, -1) == LUA_TNUMBER)
-    rc = (int) lua_tointeger(L, -1);
-  else if (lua_type(L, -1) == LUA_TBOOLEAN && !lua_toboolean(L, -1))
-    rc = SQLITE_DENY;
-  lua_pop(L, 1);
-  return rc;
+  return 1;
+}
+
+static tk_auth_policy *db_auth_build (lua_State *L, int idx, const char **err) {
+  luaL_checkstack(L, 5, "authorizer");
+  lua_pushnil(L);
+  while (lua_next(L, idx)) {
+    if (lua_type(L, -2) != LUA_TSTRING ||
+        (strcmp(lua_tostring(L, -2), "deny") != 0 &&
+         strcmp(lua_tostring(L, -2), "pragmas") != 0)) {
+      lua_pop(L, 2);
+      *err = "unknown policy key; expected deny and pragmas only";
+      return NULL;
+    }
+    lua_pop(L, 1);
+  }
+  int has_deny = db_auth_field(L, idx, "deny", err);
+  if (has_deny < 0)
+    return NULL;
+  int deny_idx = lua_gettop(L);
+  size_t n_deny = has_deny ? lua_objlen(L, deny_idx) : 0;
+  for (size_t i = 1; i <= n_deny; i++) {
+    lua_rawgeti(L, deny_idx, (int) i);
+    if (lua_type(L, -1) != LUA_TNUMBER) {
+      lua_pop(L, 2);
+      *err = "deny entries must be action codes";
+      return NULL;
+    }
+    lua_Number v = lua_tonumber(L, -1);
+    int code = (int) v;
+    if ((lua_Number) code != v || code < 1 || code >= TK_AUTH_NCODES) {
+      lua_pop(L, 2);
+      *err = "deny entry is not a known action code";
+      return NULL;
+    }
+    lua_pop(L, 1);
+  }
+  int has_pragmas = db_auth_field(L, idx, "pragmas", err);
+  if (has_pragmas < 0) {
+    lua_pop(L, 1);
+    return NULL;
+  }
+  int prag_idx = lua_gettop(L);
+  size_t n_pragmas = has_pragmas ? lua_objlen(L, prag_idx) : 0;
+  for (size_t i = 1; i <= n_pragmas; i++) {
+    lua_rawgeti(L, prag_idx, (int) i);
+    if (lua_type(L, -1) != LUA_TSTRING) {
+      lua_pop(L, 3);
+      *err = "pragmas entries must be strings";
+      return NULL;
+    }
+    size_t len = 0;
+    const char *name = lua_tolstring(L, -1, &len);
+    if (len == 0 || memchr(name, 0, len)) {
+      lua_pop(L, 3);
+      *err = "pragma name is empty or contains a nul byte";
+      return NULL;
+    }
+    lua_pop(L, 1);
+  }
+  tk_auth_policy *p = (tk_auth_policy *) calloc(1, sizeof(tk_auth_policy));
+  if (!p) {
+    lua_pop(L, 2);
+    *err = "out of memory";
+    return NULL;
+  }
+  if (n_pragmas) {
+    p->pragmas = (char **) calloc(n_pragmas, sizeof(char *));
+    if (!p->pragmas) {
+      lua_pop(L, 2);
+      free(p);
+      *err = "out of memory";
+      return NULL;
+    }
+    p->n_pragmas = n_pragmas;
+  }
+  for (size_t i = 1; i <= n_deny; i++) {
+    lua_rawgeti(L, deny_idx, (int) i);
+    p->deny[(int) lua_tonumber(L, -1)] = 1;
+    lua_pop(L, 1);
+  }
+  for (size_t i = 1; i <= n_pragmas; i++) {
+    lua_rawgeti(L, prag_idx, (int) i);
+    size_t len = 0;
+    const char *name = lua_tolstring(L, -1, &len);
+    p->pragmas[i - 1] = tk_auth_dup_lower(name, len);
+    lua_pop(L, 1);
+    if (!p->pragmas[i - 1]) {
+      lua_pop(L, 2);
+      db_auth_policy_free(p);
+      *err = "out of memory";
+      return NULL;
+    }
+  }
+  lua_pop(L, 2);
+  if (p->n_pragmas > 1)
+    qsort(p->pragmas, p->n_pragmas, sizeof(char *), tk_auth_sort_cmp);
+  return p;
 }
 
 static tk_sqlite_stmt *check_stmt (lua_State *L, int idx) {
   return (tk_sqlite_stmt *) luaL_checkudata(L, idx, TK_SQLITE_STMT_MT);
 }
 
+static sqlite3_stmt *stmt_handle (lua_State *L, tk_sqlite_stmt *s, const char *what) {
+  if (!s->handle || !s->db)
+    luaL_error(L, "%s: statement is finalized", what);
+  return s->handle;
+}
+
 static int db_exec (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
   const char *sql = luaL_checkstring(L, 2);
-  int rc = sqlite3_exec(db->handle, sql, NULL, NULL, NULL);
+  sqlite3 *h = db_handle(L, db, "exec");
+  db->busy++;
+  int rc = sqlite3_exec(h, sql, NULL, NULL, NULL);
+  db->busy--;
   lua_pushinteger(L, rc);
   return 1;
 }
@@ -145,17 +312,25 @@ static int db_prepare (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
   size_t len;
   const char *sql = luaL_checklstring(L, 2, &len);
+  sqlite3 *h = db_handle(L, db, "prepare");
   sqlite3_stmt *raw = NULL;
-  int rc = sqlite3_prepare_v2(db->handle, sql, (int) len, &raw, NULL);
+  db->busy++;
+  int rc = sqlite3_prepare_v2(h, sql, (int) len, &raw, NULL);
+  db->busy--;
   if (rc != SQLITE_OK || !raw) {
-    return luaL_error(L, "prepare: %s", sqlite3_errmsg(db->handle));
+    sqlite3_finalize(raw);
+    return luaL_error(L, "prepare: %s", sqlite3_errmsg(h));
   }
   tk_sqlite_stmt *s = (tk_sqlite_stmt *) lua_newuserdata(L, sizeof(tk_sqlite_stmt));
   memset(s, 0, sizeof(tk_sqlite_stmt));
-  s->handle = raw;
-  stmt_link(db, s);
   luaL_getmetatable(L, TK_SQLITE_STMT_MT);
   lua_setmetatable(L, -2);
+  s->handle = raw;
+  stmt_link(db, s);
+  lua_createtable(L, 1, 0);
+  lua_pushvalue(L, 1);
+  lua_rawseti(L, -2, 1);
+  lua_setfenv(L, -2);
   return 1;
 }
 
@@ -173,13 +348,14 @@ static int db_errcode (lua_State *L) {
 
 static int db_close (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
+  db_check_idle(L, db, "close");
   int rc = SQLITE_OK;
   if (db->handle) {
-    db_auth_clear(L, db);
-    db_prog_clear(L, db);
     rc = sqlite3_close(db->handle);
     if (rc == SQLITE_OK) {
       db->handle = NULL;
+      db_auth_clear(db);
+      db_prog_clear(db);
       db_release_key(db);
     }
   }
@@ -187,35 +363,56 @@ static int db_close (lua_State *L) {
   return 1;
 }
 
+static void db_auth_deny_all (tk_sqlite_db *db, sqlite3 *h) {
+  db_auth_policy_free(db->auth);
+  db->auth = NULL;
+  sqlite3_set_authorizer(h, db_auth_cb, db);
+}
+
 static int db_authorizer (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
-  db_auth_clear(L, db);
-  if (lua_isnoneornil(L, 2))
+  db_check_idle(L, db, "authorizer");
+  sqlite3 *h = db_handle(L, db, "authorizer");
+  if (lua_isnoneornil(L, 2)) {
+    db_auth_clear(db);
     return 0;
-  luaL_checktype(L, 2, LUA_TFUNCTION);
-  lua_pushvalue(L, 2);
-  db->auth_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  db->auth_L = L;
-  sqlite3_set_authorizer(db->handle, db_auth_cb, db);
+  }
+  if (lua_type(L, 2) != LUA_TTABLE) {
+    db_auth_deny_all(db, h);
+    return luaL_error(L, "authorizer: expected a policy table or nil");
+  }
+  const char *err = NULL;
+  tk_auth_policy *p = db_auth_build(L, 2, &err);
+  if (!p) {
+    db_auth_deny_all(db, h);
+    return luaL_error(L, "authorizer: %s", err ? err : "invalid policy");
+  }
+  db_auth_policy_free(db->auth);
+  db->auth = p;
+  sqlite3_set_authorizer(h, db_auth_cb, db);
   return 0;
 }
 
 static int db_progress (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
-  db_prog_clear(L, db);
-  if (lua_isnoneornil(L, 2))
+  db_check_idle(L, db, "progress");
+  sqlite3 *h = db_handle(L, db, "progress");
+  int n = 0, budget = 0;
+  if (!lua_isnoneornil(L, 2)) {
+    n = (int) luaL_checkinteger(L, 2);
+    budget = (int) luaL_checkinteger(L, 3);
+  }
+  db_prog_clear(db);
+  if (n <= 0 || budget <= 0)
     return 0;
-  int n = (int) luaL_checkinteger(L, 2);
-  luaL_checktype(L, 3, LUA_TFUNCTION);
-  lua_pushvalue(L, 3);
-  db->prog_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  db->prog_L = L;
-  sqlite3_progress_handler(db->handle, n > 0 ? n : 1, db_prog_cb, db);
+  db->prog_budget = budget;
+  sqlite3_progress_handler(h, n, db_prog_cb, db);
   return 0;
 }
 
 static int db_close_vm (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
+  db_check_idle(L, db, "close_vm");
   while (db->stmts) {
     tk_sqlite_stmt *s = db->stmts;
     if (s->handle) {
@@ -229,7 +426,8 @@ static int db_close_vm (lua_State *L) {
 
 static int db_last_insert_rowid (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
-  lua_pushnumber(L, (lua_Number) sqlite3_last_insert_rowid(db->handle));
+  sqlite3 *h = db_handle(L, db, "last_insert_rowid");
+  lua_pushnumber(L, (lua_Number) sqlite3_last_insert_rowid(h));
   return 1;
 }
 
@@ -248,8 +446,8 @@ static int db_reset_cache (lua_State *L) {
 
 static int db_gc (lua_State *L) {
   tk_sqlite_db *db = check_db(L, 1);
-  db_auth_clear(L, db);
-  db_prog_clear(L, db);
+  db_auth_clear(db);
+  db_prog_clear(db);
   if (db->handle) {
     while (db->stmts) {
       tk_sqlite_stmt *s = db->stmts;
@@ -268,14 +466,20 @@ static int db_gc (lua_State *L) {
 
 static int stmt_step (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  lua_pushinteger(L, sqlite3_step(s->handle));
+  sqlite3_stmt *h = stmt_handle(L, s, "step");
+  tk_sqlite_db *db = s->db;
+  db->busy++;
+  int rc = sqlite3_step(h);
+  db->busy--;
+  lua_pushinteger(L, rc);
   return 1;
 }
 
 static int stmt_reset (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  int rc = sqlite3_reset(s->handle);
-  sqlite3_clear_bindings(s->handle);
+  sqlite3_stmt *h = stmt_handle(L, s, "reset");
+  int rc = sqlite3_reset(h);
+  sqlite3_clear_bindings(h);
   lua_pushinteger(L, rc);
   return 1;
 }
@@ -303,8 +507,8 @@ static void bind_one (lua_State *L, sqlite3_stmt *h, int pidx, int vidx) {
     }
     case LUA_TUSERDATA: {
       void *ptr; int cnt, type;
-      if (detect_vec(L, vidx, &ptr, &cnt, &type)) {
-        tk_ca_bind *b = malloc(sizeof(*b));
+      tk_ca_bind *b = detect_vec(L, vidx, &ptr, &cnt, &type) ? malloc(sizeof(*b)) : NULL;
+      if (b) {
         b->ptr = ptr;
         b->cnt = cnt;
         b->type = type;
@@ -322,15 +526,17 @@ static void bind_one (lua_State *L, sqlite3_stmt *h, int pidx, int vidx) {
 
 static int stmt_bind_values (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_values");
   int n = lua_gettop(L) - 1;
   for (int i = 1; i <= n; i++)
-    bind_one(L, s->handle, i, i + 1);
+    bind_one(L, h, i, i + 1);
   lua_pushinteger(L, SQLITE_OK);
   return 1;
 }
 
 static int stmt_bind_names (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_names");
   luaL_checktype(L, 2, LUA_TTABLE);
   lua_pushnil(L);
   while (lua_next(L, 2)) {
@@ -340,9 +546,9 @@ static int stmt_bind_names (lua_State *L) {
       buf[0] = ':';
       strncpy(buf + 1, key, sizeof(buf) - 2);
       buf[sizeof(buf) - 1] = '\0';
-      int pidx = sqlite3_bind_parameter_index(s->handle, buf);
+      int pidx = sqlite3_bind_parameter_index(h, buf);
       if (pidx > 0)
-        bind_one(L, s->handle, pidx, lua_gettop(L));
+        bind_one(L, h, pidx, lua_gettop(L));
     }
     lua_pop(L, 1);
   }
@@ -372,18 +578,20 @@ static void push_column (lua_State *L, sqlite3_stmt *h, int col) {
 
 static int stmt_get_value (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "get_value");
   int col = (int) luaL_checkinteger(L, 2);
-  push_column(L, s->handle, col);
+  push_column(L, h, col);
   return 1;
 }
 
 static int stmt_get_named_values (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  int ncols = sqlite3_column_count(s->handle);
+  sqlite3_stmt *h = stmt_handle(L, s, "get_named_values");
+  int ncols = sqlite3_column_count(h);
   lua_createtable(L, 0, ncols);
   for (int i = 0; i < ncols; i++) {
-    const char *name = sqlite3_column_name(s->handle, i);
-    push_column(L, s->handle, i);
+    const char *name = sqlite3_column_name(h, i);
+    push_column(L, h, i);
     lua_setfield(L, -2, name);
   }
   return 1;
@@ -565,6 +773,7 @@ static int detect_vec (lua_State *L, int idx, void **ptr, int *cnt, int *type) {
 
 static int stmt_bind_carray (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_carray");
   int pidx = (int)luaL_checkinteger(L, 2);
   void *data; int cnt, type;
   if (!detect_vec(L, 3, &data, &cnt, &type))
@@ -586,23 +795,25 @@ static int stmt_bind_carray (lua_State *L) {
   b->ptr = (char *) data + (size_t) start * esz;
   b->cnt = count;
   b->type = type;
-  sqlite3_bind_pointer(s->handle, pidx, b, "carray", tk_ca_bind_free);
+  sqlite3_bind_pointer(h, pidx, b, "carray", tk_ca_bind_free);
   lua_pushinteger(L, SQLITE_OK);
   return 1;
 }
 
 static int stmt_columns (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  lua_pushinteger(L, sqlite3_column_count(s->handle));
+  sqlite3_stmt *h = stmt_handle(L, s, "columns");
+  lua_pushinteger(L, sqlite3_column_count(h));
   return 1;
 }
 
 static int stmt_column_names (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  int n = sqlite3_column_count(s->handle);
+  sqlite3_stmt *h = stmt_handle(L, s, "column_names");
+  int n = sqlite3_column_count(h);
   lua_createtable(L, n, 0);
   for (int i = 0; i < n; i++) {
-    const char *name = sqlite3_column_name(s->handle, i);
+    const char *name = sqlite3_column_name(h, i);
     lua_pushstring(L, name ? name : "");
     lua_rawseti(L, -2, i + 1);
   }
@@ -611,10 +822,11 @@ static int stmt_column_names (lua_State *L) {
 
 static int stmt_get_values (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
-  int n = sqlite3_column_count(s->handle);
+  sqlite3_stmt *h = stmt_handle(L, s, "get_values");
+  int n = sqlite3_column_count(h);
   lua_createtable(L, n, 0);
   for (int i = 0; i < n; i++) {
-    push_column(L, s->handle, i);
+    push_column(L, h, i);
     lua_rawseti(L, -2, i + 1);
   }
   return 1;
@@ -676,13 +888,8 @@ static void create_mt (lua_State *L, const char *name, luaL_Reg *methods, lua_CF
 static int push_db (lua_State *L, sqlite3 *raw) {
   sqlite3_create_module(raw, "carray", &tk_carray_module, NULL);
   tk_sqlite_db *db = (tk_sqlite_db *) lua_newuserdata(L, sizeof(tk_sqlite_db));
+  memset(db, 0, sizeof(tk_sqlite_db));
   db->handle = raw;
-  db->stmts = NULL;
-  db->enc_path = NULL;
-  db->auth_L = NULL;
-  db->auth_ref = LUA_NOREF;
-  db->prog_L = NULL;
-  db->prog_ref = LUA_NOREF;
   luaL_getmetatable(L, TK_SQLITE_DB_MT);
   lua_setmetatable(L, -2);
   return 1;
@@ -1405,8 +1612,6 @@ int luaopen_santoku_sqlite_db (lua_State *L) {
   lua_pushcfunction(L, tk_complete);
   lua_setfield(L, -2, "complete");
   struct { const char *name; int value; } auth_consts[] = {
-    { "DENY", SQLITE_DENY },
-    { "IGNORE", SQLITE_IGNORE },
     { "CREATE_INDEX", SQLITE_CREATE_INDEX },
     { "CREATE_TABLE", SQLITE_CREATE_TABLE },
     { "CREATE_TEMP_INDEX", SQLITE_CREATE_TEMP_INDEX },

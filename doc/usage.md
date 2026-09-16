@@ -227,34 +227,50 @@ sqlite.complete("select 1;")                      -- true
 sqlite.complete("select 1")                       -- false
 ```
 
-`db.authorizer(fn)` installs a compile-time hook called per action during prepare.
-Return `true`/`nil` to allow, `false` to deny, or a code (`sqlite.DENY`,
-`sqlite.IGNORE`) verbatim. Action codes are on the module (`sqlite.ATTACH`,
-`sqlite.CREATE_TABLE`, `sqlite.READ`, ...); `db.authorizer(nil)` uninstalls. An
-error raised inside the callback denies.
+`db.authorizer(spec)` installs a declarative policy enforced in C during prepare.
+No Lua runs in the callback: the spec is read once at registration and copied into
+C-owned memory. `db.authorizer(nil)` uninstalls.
 
 ```lua
-db.authorizer(function (code)
-  return code ~= sqlite.ATTACH
-end)
+db.authorizer({
+  deny = { sqlite.ATTACH, sqlite.DETACH },
+  pragmas = { "table_info", "table_xinfo", "integrity_check" },
+})
 ```
 
-`db.progress(n, fn)` installs a VDBE progress handler called every `n` steps; return
-truthy to interrupt the running statement (it errors with "interrupted"). An error
-raised inside the callback also interrupts. `db.progress(nil)` uninstalls. Use it as a
-step budget so a runaway query errors instead of hanging:
+- `deny`: array of action codes (`sqlite.ATTACH`, `sqlite.CREATE_TABLE`,
+  `sqlite.READ`, ...) refused outright. Optional; codes must be integers in
+  `[1, 63]`.
+- `pragmas`: array of pragma names allowed under `SQLITE_PRAGMA`, compared
+  case-insensitively. Optional, and absent means the empty allowlist, so every
+  pragma is denied.
+- Any other key, a non-array value, a non-integer or out-of-range code, or a
+  non-string pragma name raises.
+
+The policy is fail-closed. An action code outside `[0, 63]`, a pragma whose name
+sqlite does not supply, and a pragma not on the allowlist all deny. A registration
+that raises leaves the connection denying every action until a valid spec or `nil`
+is installed, so a rejected policy can never read as permissive. The installed
+policy is owned by the connection and freed on re-registration, `db.authorizer(nil)`,
+`db.close`, and garbage collection; it is independent of the coroutine that
+registered it.
+
+`db.progress(n, budget)` installs a VDBE step budget enforced in C with no Lua
+callback: the handler ticks every `n` VDBE ops and interrupts the running statement
+(it errors with "interrupted") once `budget` ticks have elapsed. Calling it again
+re-arms and zeroes the tick count; `db.progress(nil)` uninstalls. The count is
+per connection and spans statements, so re-arm before each unit of work you want
+budgeted:
 
 ```lua
-local steps = 0
-db.progress(1000, function ()
-  steps = steps + 1
-  return steps > 10000
-end)
+db.progress(1000, 10000)
 ```
 
 Anchor: `test/spec/santoku/sqlite/db.lua` ("complete detects statement boundaries",
-"query returns rows and column names for ad-hoc sql", "authorizer denies and detects",
-"progress budget interrupts a runaway query").
+"query returns rows and column names for ad-hoc sql", "authorizer policy denies codes
+and gates pragmas", "authorizer policy rejects malformed specs and denies after",
+"progress budget interrupts a runaway query", "authorizer policy survives the coroutine
+that installed it", "closed handles and finalized statements raise").
 
 ## Gotchas
 

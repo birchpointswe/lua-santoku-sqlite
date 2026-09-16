@@ -247,58 +247,121 @@ end)
 
 test("progress budget interrupts a runaway query", function ()
   local db = sql(sqlite.open_memory())
-  local calls = 0
-  db.progress(100, function ()
-    calls = calls + 1
-    return calls > 3
-  end)
-  local ok = pcall(function ()
+  db.progress(100, 3)
+  local runaway = function ()
     return db.query(
       "with recursive c(x) as (select 1 union all select x + 1 from c) select max(x) from c")
-  end)
-  assert(eq(ok, false))
-  assert(eq(calls > 3, true))
+  end
+  assert(eq(pcall(runaway), false))
+  assert(eq(pcall(runaway), false))
+  db.progress(100, 3)
+  assert(eq(pcall(runaway), false))
   db.progress(nil)
   local rows = db.query("select 1")
   assert(eq(rows[1][1], 1))
   db.close()
 end)
 
-test("authorizer denies and detects", function ()
+test("progress budget survives the coroutine that installed it", function ()
+  local db = sql(sqlite.open_memory())
+  local co = coroutine.create(function ()
+    db.progress(100, 3)
+  end)
+  coroutine.resume(co)
+  co = nil -- luacheck: ignore
+  collectgarbage("collect")
+  collectgarbage("collect")
+  local ok = pcall(function ()
+    return db.query(
+      "with recursive c(x) as (select 1 union all select x + 1 from c) select max(x) from c")
+  end)
+  assert(eq(ok, false))
+  db.progress(nil)
+  db.close()
+end)
+
+test("authorizer policy survives the coroutine that installed it", function ()
   local db = sql(sqlite.open_memory())
   db.exec("create table t (n integer)")
-  local seen = {}
-  db.authorizer(function (code, a)
-    seen[#seen + 1] = { code, a }
-    if code == sqlite.ATTACH then
-      return false
-    end
-    return true
+  local co = coroutine.create(function ()
+    db.authorizer({
+      deny = { sqlite.ATTACH, sqlite.DETACH },
+      pragmas = { "table_info" },
+    })
   end)
-  assert(eq(pcall(function () db.query("attach ':memory:' as other") end), false))
+  coroutine.resume(co)
+  co = nil -- luacheck: ignore
+  collectgarbage("collect")
+  collectgarbage("collect")
   db.query("select n from t")
-  local saw_attach = false
-  local saw_read = false
-  for i = 1, #seen do
-    if seen[i][1] == sqlite.ATTACH then saw_attach = true end
-    if seen[i][1] == sqlite.READ and seen[i][2] == "t" then saw_read = true end
-  end
-  assert(eq(saw_attach, true))
-  assert(eq(saw_read, true))
-  local ddl = {}
-  db.authorizer(function (code, a)
-    if code == sqlite.CREATE_TABLE or code == sqlite.DROP_TABLE
-      or code == sqlite.ALTER_TABLE or code == sqlite.CREATE_VIEW
-      or code == sqlite.DROP_VIEW then
-      ddl[#ddl + 1] = { code, a }
-    end
-    return true
-  end)
+  db.query("pragma table_info(t)")
+  assert(eq(pcall(function () db.query("attach ':memory:' as other") end), false))
+  assert(eq(pcall(function () db.query("pragma page_size") end), false))
+  db.authorizer(nil)
+  db.close()
+end)
+
+test("closed handles and finalized statements raise", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (n integer)")
+  local stmt = db.db:prepare("select n from t")
+  db.close()
+  assert(eq(pcall(function () return stmt:step() end), false))
+  assert(eq(pcall(function () return stmt:reset() end), false))
+  assert(eq(pcall(function () return stmt:column_names() end), false))
+  assert(eq(pcall(function () return db.db:exec("select 1") end), false))
+  assert(eq(pcall(function () return db.db:prepare("select 1") end), false))
+  assert(eq(pcall(function () return db.db:progress(100, 3) end), false))
+  assert(eq(pcall(function () return db.db:authorizer(nil) end), false))
+  assert(eq(pcall(function () return db.db:last_insert_rowid() end), false))
+end)
+
+test("authorizer policy denies codes and gates pragmas", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (n integer)")
+  db.authorizer({
+    deny = { sqlite.ATTACH, sqlite.DETACH, sqlite.DROP_TABLE },
+    pragmas = { "TABLE_INFO", "integrity_check" },
+  })
+  db.query("select n from t")
+  db.exec("insert into t (n) values (1)")
   db.exec("create table u (m integer)")
-  assert(eq(#ddl, 1))
-  assert(eq(ddl[1][1], sqlite.CREATE_TABLE))
-  assert(eq(ddl[1][2], "u"))
+  assert(eq(pcall(function () db.query("attach ':memory:' as other") end), false))
+  assert(eq(pcall(function () db.exec("drop table u") end), false))
+  db.query("pragma table_info(t)")
+  db.query("pragma Table_Info(t)")
+  db.query("pragma integrity_check")
+  assert(eq(pcall(function () db.query("pragma page_size") end), false))
+  assert(eq(pcall(function () db.query("pragma user_version") end), false))
+  db.authorizer({ deny = { sqlite.ATTACH } })
+  assert(eq(pcall(function () db.query("pragma table_info(t)") end), false))
   db.authorizer(nil)
   db.query("attach ':memory:' as other2")
+  db.query("pragma page_size")
+  db.close()
+end)
+
+test("authorizer policy rejects malformed specs and denies after", function ()
+  local db = sql(sqlite.open_memory())
+  db.exec("create table t (n integer)")
+  local bad = {
+    function () return db.authorizer(function () return true end) end,
+    function () return db.authorizer("deny everything") end,
+    function () return db.authorizer({ denies = { sqlite.ATTACH } }) end,
+    function () return db.authorizer({ deny = sqlite.ATTACH }) end,
+    function () return db.authorizer({ deny = { "attach" } }) end,
+    function () return db.authorizer({ deny = { 1.5 } }) end,
+    function () return db.authorizer({ deny = { 9999 } }) end,
+    function () return db.authorizer({ pragmas = { 1 } }) end,
+    function () return db.authorizer({ pragmas = { "" } }) end,
+  }
+  for i = 1, #bad do
+    assert(eq(pcall(bad[i]), false))
+    assert(eq(pcall(function () db.query("select n from t") end), false))
+  end
+  db.authorizer({ deny = { sqlite.ATTACH }, pragmas = { "table_info" } })
+  db.query("select n from t")
+  db.authorizer(nil)
+  db.query("select n from t")
   db.close()
 end)

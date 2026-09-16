@@ -269,12 +269,12 @@ local function wrap (...)
       return rows_of(db, stmt, ...)
     end,
 
-    authorizer = function (fn)
-      return db:authorizer(fn)
+    authorizer = function (spec)
+      return db:authorizer(spec)
     end,
 
-    progress = function (n, fn)
-      return db:progress(n, fn)
+    progress = function (n, budget)
+      return db:progress(n, budget)
     end,
 
   }
