@@ -710,6 +710,7 @@ local function create (db, opts)
     }
     db.transaction(function ()
       db.exec("pragma defer_foreign_keys = on")
+      local caught_up = (get_served(res.replica) or 0) >= (get_seq() or 0)
       enter_quiet()
       local top = nil
       for _, e in ipairs(res.changes or {}) do
@@ -722,6 +723,7 @@ local function create (db, opts)
         apply_one(e, stats)
       end
       exit_quiet()
+      if caught_up then set_served(res.replica, get_seq() or 0) end
       local seq = tonumber(res.seq) or 0
       if seq > 0 and #stats.unreadable == 0 then set_cursor(res.replica, seq) end
       stats.cursor = get_cursor(res.replica) or 0
