@@ -971,8 +971,9 @@ static int stmt_bind_tokens (lua_State *L) {
   sqlite3_stmt *h = stmt_handle(L, s, "bind_tokens");
   int pidx = (int) luaL_checkinteger(L, 2);
   void *tdata; int tcnt, ttype;
-  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) || ttype != TK_CA_INT64)
-    return luaL_error(L, "bind_tokens: expected an ivec of token ids");
+  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) ||
+      (ttype != TK_CA_INT64 && ttype != TK_CA_INT32))
+    return luaL_error(L, "bind_tokens: expected an ivec or svec of token ids");
   void *vdata = NULL; int vcnt = 0, vtype = 0;
   int has_vals = !lua_isnoneornil(L, 4);
   if (has_vals) {
@@ -987,7 +988,8 @@ static int stmt_bind_tokens (lua_State *L) {
   if (start < 0 || count < 0 || start > tcnt || count > tcnt - start)
     return luaL_error(L, "bind_tokens: slice [%d,+%d) out of range for length %d",
       start, count, tcnt);
-  const int64_t *toks = (const int64_t *) tdata;
+  const int64_t *toks64 = (const int64_t *) tdata;
+  const int32_t *toks32 = (const int32_t *) tdata;
   const float *vals = (const float *) vdata;
   unsigned char *buf = NULL;
   size_t n = 0, cap = 0;
@@ -999,7 +1001,8 @@ static int stmt_bind_tokens (lua_State *L) {
         reps = 1;
     }
     for (long r = 0; r < reps; r ++) {
-      if (!tk_tok_emit(&buf, &n, &cap, toks[j])) {
+      int64_t id = (ttype == TK_CA_INT64) ? toks64[j] : (int64_t) toks32[j];
+      if (!tk_tok_emit(&buf, &n, &cap, id)) {
         free(buf);
         return luaL_error(L, "bind_tokens: out of memory");
       }
@@ -1017,21 +1020,25 @@ static int stmt_bind_match (lua_State *L) {
   sqlite3_stmt *h = stmt_handle(L, s, "bind_match");
   int pidx = (int) luaL_checkinteger(L, 2);
   void *tdata; int tcnt, ttype;
-  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) || ttype != TK_CA_INT64)
-    return luaL_error(L, "bind_match: expected an ivec of token ids");
+  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) ||
+      (ttype != TK_CA_INT64 && ttype != TK_CA_INT32))
+    return luaL_error(L, "bind_match: expected an ivec or svec of token ids");
   int start = (int) luaL_optinteger(L, 4, 0);
   int count = (int) luaL_optinteger(L, 5, tcnt - start);
   if (start < 0 || count < 0 || start > tcnt || count > tcnt - start)
     return luaL_error(L, "bind_match: slice [%d,+%d) out of range for length %d",
       start, count, tcnt);
-  const int64_t *toks = (const int64_t *) tdata;
+  const int64_t *toks64 = (const int64_t *) tdata;
+  const int32_t *toks32 = (const int32_t *) tdata;
   unsigned char *buf = NULL;
   size_t n = 0, cap = 0;
   int emitted = 0;
   for (int j = start; j < start + count; j ++) {
+    int64_t id = (ttype == TK_CA_INT64) ? toks64[j] : (int64_t) toks32[j];
     int dup = 0;
     for (int k = start; k < j; k ++) {
-      if (toks[k] == toks[j]) {
+      int64_t prev = (ttype == TK_CA_INT64) ? toks64[k] : (int64_t) toks32[k];
+      if (prev == id) {
         dup = 1;
         break;
       }
@@ -1046,7 +1053,7 @@ static int stmt_bind_match (lua_State *L) {
       memcpy(buf + n, " OR ", 4);
       n += 4;
     }
-    if (!tk_tok_emit(&buf, &n, &cap, toks[j])) {
+    if (!tk_tok_emit(&buf, &n, &cap, id)) {
       free(buf);
       return luaL_error(L, "bind_match: out of memory");
     }

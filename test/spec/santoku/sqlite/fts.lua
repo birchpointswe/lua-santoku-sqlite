@@ -124,3 +124,37 @@ test("fts: query terms are OR-ed rather than AND-ed", function ()
   assert(eq(#res, 2))
 
 end)
+
+test("fts: accepts svec neighbors, which is what the tokenizer emits", function ()
+
+  local svec = require("santoku.svec")
+  local db = sql(sqlite.open_memory())
+  local idx = fts.create(db, { name = "docs" })
+
+  local function mksvec (offsets, tokens, weights)
+    return csr.create({
+      offsets = ivec.create(offsets),
+      neighbors = svec.create(tokens),
+      values = fvec.create(weights),
+    })
+  end
+
+  idx.add(
+    { "a", "b" },
+    mksvec(
+      { 0, 3, 5 },
+      { 1, 2, 3, 3, 4 },
+      { 1, 1, 1, 1, 1 }))
+
+  local res = idx.search(mksvec({ 0, 1 }, { 3 }, { 1 }), 10)
+  assert(eq(#res, 2))
+
+  res = idx.search(mksvec({ 0, 1 }, { 1 }, { 1 }), 10)
+  assert(eq(#res, 1))
+  assert(eq(res[1].id, "a"))
+
+  res = idx.search(mksvec({ 0, 1 }, { 4 }, { 1 }), 10)
+  assert(eq(#res, 1))
+  assert(eq(res[1].id, "b"))
+
+end)
