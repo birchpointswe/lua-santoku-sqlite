@@ -154,20 +154,26 @@ int64, `svec` int32, `fvec` float, `dvec` double.
 
 Anchor: `test/spec/santoku/sqlite/carray.lua`.
 
-## search: TF / cosine index
+## fts: full-text search over your own tokens
 
-`search.create(db, opts)` builds tables `<name>_tf` and (when weighted) `<name>_doc`.
-Documents are `csr` rows: ids are token ids, values are term weights.
+`fts.create(db, opts)` builds a contentless FTS5 index plus a `<name>_map` table that
+maps your text ids to the integer rowids FTS5 requires. Documents are `csr` rows: ids
+are token ids, values are term frequencies.
 
-### Weighted (cosine), the default
+Tokenization stays in santoku. A C tokenizer registered as `santoku` receives token ids
+packed by `stmt:bind_tokens` and emits them directly, so `regions`, `terminals`, `tags`
+and `focus` all still decide what a token is. FTS5 never sees your text.
+
+Ranking is FTS5's `bm25()`, which reads the repeats as term frequency and applies
+document-length normalisation. Do **not** pre-weight the csr with `csr:idf()` or
+`csr:bm25()` here; bm25 does that itself. Scores sort ascending, lower being better.
 
 ```lua
-local search = require("santoku.sqlite.search")
+local fts = require("santoku.sqlite.fts")
 local ivec, fvec, csr = require("santoku.ivec"), require("santoku.fvec"), require("santoku.csr")
 
-local idx = search.create(db, { name = "docs" })
+local idx = fts.create(db, { name = "docs" })
 
--- three docs in one batch: a={1,2,3}, b={2,3,4}, c={5,6}
 idx.add(
   { "a", "b", "c" },
   csr.create({
@@ -176,36 +182,26 @@ idx.add(
     values    = fvec.create({ 1, 1, 1, 1, 1, 1, 1, 1 }),
   }))
 
--- query tokens {2,3}: matches a and b, score = cosine
-local hits = idx.search(
-  csr.create({ offsets = ivec.create({0,2}), neighbors = ivec.create({2,3}), values = fvec.create({1,1}) }),
-  10)                                           -- { { id = "a", score = ... }, ... }
+local q = csr.create({
+  offsets   = ivec.create({ 0, 2 }),
+  neighbors = ivec.create({ 2, 3 }),
+  values    = fvec.create({ 1, 1 }),
+})
+
+for _, hit in ipairs(idx.search(q, 10)) do
+  print(hit.id, hit.score)
+end
+
+idx.remove({ "a" })
+idx.clear()
 ```
 
-`add` replaces a doc's prior rows (re-adding an id with new tokens reindexes it). `remove`
-takes an id list; `clear` empties the index. A weighted index requires a csr with values;
-an empty token row in a batch raises (and inside `db.transaction` the whole batch rolls
-back).
+`opts` takes `name`, an optional `schema`, and an optional `detail` of `full`, `column`
+or `none`. Query terms are OR-ed: the MATCH expression is built in C by
+`stmt:bind_match`, so no caller writes FTS5 query syntax. Re-adding an id replaces it,
+and deletes work because the table is created with `contentless_delete=1`.
 
-### Presence-only
-
-```lua
-local idx = search.create(db, { name = "pres", weighted = false })   -- ranks by match count
-idx.add({ "a", "b" }, csr.create({ offsets = ivec.create({0,3,5}), neighbors = ivec.create({1,2,3,1,4}) }))
--- query {1,2,3}: a matches 3, b matches 1
-```
-
-### Partitioned
-
-```lua
-local idx = search.create(db, { name = "p", partition = true })
-idx.add("u1", { "doc1" }, q_csr)                -- every call takes a leading partition
-idx.search("u1", q_csr, 10)
-idx.clear("u1")                                 -- isolated from u2
-```
-
-Anchor: `test/spec/santoku/sqlite/search.lua` (all five scenarios above plus the
-transaction-rollback case).
+Anchor: `test/spec/santoku/sqlite/fts.lua`.
 
 ## Ad-hoc SQL: query, complete, authorizer
 

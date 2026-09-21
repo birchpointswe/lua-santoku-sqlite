@@ -856,6 +856,9 @@ static luaL_Reg db_methods[] = {
   { NULL, NULL }
 };
 
+static int stmt_bind_tokens (lua_State *L);
+static int stmt_bind_match (lua_State *L);
+
 static luaL_Reg stmt_methods[] = {
   { "step", stmt_step },
   { "reset", stmt_reset },
@@ -867,6 +870,8 @@ static luaL_Reg stmt_methods[] = {
   { "column_names", stmt_column_names },
   { "get_values", stmt_get_values },
   { "bind_carray", stmt_bind_carray },
+  { "bind_tokens", stmt_bind_tokens },
+  { "bind_match", stmt_bind_match },
   { NULL, NULL }
 };
 
@@ -885,8 +890,182 @@ static void create_mt (lua_State *L, const char *name, luaL_Reg *methods, lua_CF
   lua_pop(L, 1);
 }
 
+static unsigned char tk_fts5_tok_inst;
+
+static int tk_fts5_tok_create (
+  void *unused, const char **azArg, int nArg, Fts5Tokenizer **ppOut
+) {
+  (void) unused; (void) azArg; (void) nArg;
+  *ppOut = (Fts5Tokenizer *) &tk_fts5_tok_inst;
+  return SQLITE_OK;
+}
+
+static void tk_fts5_tok_delete (Fts5Tokenizer *p) {
+  (void) p;
+}
+
+static int tk_fts5_tok_tokenize (
+  Fts5Tokenizer *tok, void *pCtx, int flags,
+  const char *pText, int nText,
+  int (*xToken)(void *, int, const char *, int, int, int)
+) {
+  (void) tok; (void) flags;
+  int i = 0;
+  while (i < nText) {
+    int s = i;
+    while (i < nText && ((unsigned char) pText[i] & 0x40))
+      i ++;
+    if (i < nText)
+      i ++;
+    int rc = xToken(pCtx, 0, pText + s, i - s, s, i);
+    if (rc != SQLITE_OK)
+      return rc;
+  }
+  return SQLITE_OK;
+}
+
+static fts5_tokenizer tk_fts5_tokenizer = {
+  tk_fts5_tok_create, tk_fts5_tok_delete, tk_fts5_tok_tokenize
+};
+
+static void tk_register_fts5 (sqlite3 *raw) {
+  fts5_api *api = NULL;
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(raw, "select fts5(?1)", -1, &st, NULL) != SQLITE_OK)
+    return;
+  sqlite3_bind_pointer(st, 1, (void *) &api, "fts5_api_ptr", NULL);
+  sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (api != NULL)
+    api->xCreateTokenizer(api, "santoku", NULL, &tk_fts5_tokenizer, NULL);
+}
+
+static int tk_tok_reserve (unsigned char **buf, size_t *n, size_t *cap, size_t extra) {
+  if (*n + extra <= *cap)
+    return 1;
+  size_t want = (*cap ? *cap * 2 : 256);
+  while (want < *n + extra)
+    want *= 2;
+  unsigned char *next = realloc(*buf, want);
+  if (next == NULL)
+    return 0;
+  *buf = next;
+  *cap = want;
+  return 1;
+}
+
+static int tk_tok_emit (unsigned char **buf, size_t *n, size_t *cap, int64_t id) {
+  if (!tk_tok_reserve(buf, n, cap, 6))
+    return 0;
+  uint64_t v = (uint64_t) id;
+  while (v >= 0x40) {
+    (*buf)[(*n) ++] = (unsigned char) (0xC0 | (v & 0x3F));
+    v >>= 6;
+  }
+  (*buf)[(*n) ++] = (unsigned char) (0x80 | v);
+  return 1;
+}
+
+static int stmt_bind_tokens (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_tokens");
+  int pidx = (int) luaL_checkinteger(L, 2);
+  void *tdata; int tcnt, ttype;
+  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) || ttype != TK_CA_INT64)
+    return luaL_error(L, "bind_tokens: expected an ivec of token ids");
+  void *vdata = NULL; int vcnt = 0, vtype = 0;
+  int has_vals = !lua_isnoneornil(L, 4);
+  if (has_vals) {
+    if (!detect_vec(L, 4, &vdata, &vcnt, &vtype) || vtype != TK_CA_FLOAT)
+      return luaL_error(L, "bind_tokens: expected an fvec of term frequencies");
+    if (vcnt != tcnt)
+      return luaL_error(L, "bind_tokens: token and frequency lengths differ (%d vs %d)",
+        tcnt, vcnt);
+  }
+  int start = (int) luaL_optinteger(L, 5, 0);
+  int count = (int) luaL_optinteger(L, 6, tcnt - start);
+  if (start < 0 || count < 0 || start > tcnt || count > tcnt - start)
+    return luaL_error(L, "bind_tokens: slice [%d,+%d) out of range for length %d",
+      start, count, tcnt);
+  const int64_t *toks = (const int64_t *) tdata;
+  const float *vals = (const float *) vdata;
+  unsigned char *buf = NULL;
+  size_t n = 0, cap = 0;
+  for (int j = start; j < start + count; j ++) {
+    long reps = 1;
+    if (has_vals) {
+      reps = (long) (vals[j] + 0.5f);
+      if (reps < 1)
+        reps = 1;
+    }
+    for (long r = 0; r < reps; r ++) {
+      if (!tk_tok_emit(&buf, &n, &cap, toks[j])) {
+        free(buf);
+        return luaL_error(L, "bind_tokens: out of memory");
+      }
+    }
+  }
+  int rc = sqlite3_bind_blob(h, pidx, buf ? (void *) buf : (void *) "", (int) n,
+    SQLITE_TRANSIENT);
+  free(buf);
+  lua_pushinteger(L, rc);
+  return 1;
+}
+
+static int stmt_bind_match (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_match");
+  int pidx = (int) luaL_checkinteger(L, 2);
+  void *tdata; int tcnt, ttype;
+  if (!detect_vec(L, 3, &tdata, &tcnt, &ttype) || ttype != TK_CA_INT64)
+    return luaL_error(L, "bind_match: expected an ivec of token ids");
+  int start = (int) luaL_optinteger(L, 4, 0);
+  int count = (int) luaL_optinteger(L, 5, tcnt - start);
+  if (start < 0 || count < 0 || start > tcnt || count > tcnt - start)
+    return luaL_error(L, "bind_match: slice [%d,+%d) out of range for length %d",
+      start, count, tcnt);
+  const int64_t *toks = (const int64_t *) tdata;
+  unsigned char *buf = NULL;
+  size_t n = 0, cap = 0;
+  int emitted = 0;
+  for (int j = start; j < start + count; j ++) {
+    int dup = 0;
+    for (int k = start; k < j; k ++) {
+      if (toks[k] == toks[j]) {
+        dup = 1;
+        break;
+      }
+    }
+    if (dup)
+      continue;
+    if (emitted) {
+      if (!tk_tok_reserve(&buf, &n, &cap, 4)) {
+        free(buf);
+        return luaL_error(L, "bind_match: out of memory");
+      }
+      memcpy(buf + n, " OR ", 4);
+      n += 4;
+    }
+    if (!tk_tok_emit(&buf, &n, &cap, toks[j])) {
+      free(buf);
+      return luaL_error(L, "bind_match: out of memory");
+    }
+    emitted = 1;
+  }
+  if (!emitted) {
+    free(buf);
+    lua_pushnil(L);
+    return 1;
+  }
+  int rc = sqlite3_bind_text(h, pidx, (const char *) buf, (int) n, SQLITE_TRANSIENT);
+  free(buf);
+  lua_pushinteger(L, rc);
+  return 1;
+}
+
 static int push_db (lua_State *L, sqlite3 *raw) {
   sqlite3_create_module(raw, "carray", &tk_carray_module, NULL);
+  tk_register_fts5(raw);
   tk_sqlite_db *db = (tk_sqlite_db *) lua_newuserdata(L, sizeof(tk_sqlite_db));
   memset(db, 0, sizeof(tk_sqlite_db));
   db->handle = raw;
