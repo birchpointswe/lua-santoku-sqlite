@@ -1035,16 +1035,6 @@ static int stmt_bind_match (lua_State *L) {
   int emitted = 0;
   for (int j = start; j < start + count; j ++) {
     int64_t id = (ttype == TK_CA_INT64) ? toks64[j] : (int64_t) toks32[j];
-    int dup = 0;
-    for (int k = start; k < j; k ++) {
-      int64_t prev = (ttype == TK_CA_INT64) ? toks64[k] : (int64_t) toks32[k];
-      if (prev == id) {
-        dup = 1;
-        break;
-      }
-    }
-    if (dup)
-      continue;
     if (emitted) {
       if (!tk_tok_reserve(&buf, &n, &cap, 4)) {
         free(buf);

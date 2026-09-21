@@ -16,7 +16,7 @@ end
 
 local env = {
   name = "santoku-sqlite",
-  version = "4.0.4-1",
+  version = "4.0.5-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,

@@ -158,3 +158,24 @@ test("fts: accepts svec neighbors, which is what the tokenizer emits", function 
   assert(eq(res[1].id, "b"))
 
 end)
+
+test("fts: repeated query terms are not deduped, so query tf affects scoring", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = fts.create(db, { name = "docs" })
+
+  idx.add(
+    { "a", "b" },
+    mkcsr(
+      { 0, 2, 4 },
+      { 1, 2, 1, 3 },
+      { 3, 1, 1, 3 }))
+
+  local once = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10)
+  local twice = idx.search(mkcsr({ 0, 2 }, { 1, 1 }, { 1, 1 }), 10)
+
+  assert(eq(#once, 2))
+  assert(eq(#twice, 2))
+  assert(once[1].score ~= twice[1].score)
+
+end)
