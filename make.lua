@@ -1,4 +1,5 @@
 local fs = require("santoku.fs")
+local rock = require("santoku.make.rock")
 local vendor = require("santoku.make.vendor")
 
 local vendored = {
@@ -16,7 +17,7 @@ end
 
 local env = {
   name = "santoku-sqlite",
-  version = "4.0.6-1",
+  version = "4.0.7-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
   public = true,
@@ -25,7 +26,7 @@ local env = {
   },
   cflags = {
     "-I$(PWD)/deps/sqlite3/",
-    "-I$(shell luarocks show santoku-monocypher --rock-dir)/include/",
+    rock.include("santoku-monocypher"),
   },
   ldflags = {
     "$(PWD)/deps/sqlite3/sqlite-amalgamation-3490200/libsqlite3.a",
