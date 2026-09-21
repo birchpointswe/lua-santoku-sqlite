@@ -51,7 +51,7 @@ local function create (db, opts)
   local ins_ft = rawdb:prepare(
     "insert into " .. tbl .. "_ft (rowid, body) values (?1, ?2)")
   local search_stmt = rawdb:prepare(
-    "select m.id as id, bm25(" .. name .. "_ft) as score " ..
+    "select m.id as id, santoku_bm25(" .. name .. "_ft, ?3) as score " ..
     "from " .. tbl .. "_ft join " .. tbl .. "_map m on m.rid = " .. name .. "_ft.rowid " ..
     "where " .. name .. "_ft match ?2 order by score limit ?1")
 
@@ -112,6 +112,7 @@ local function create (db, opts)
   local function search (csr, limit)
     local offs = csr:offsets()
     local nbrs = csr:neighbors()
+    local vals = csr:values()
     local lo = offs:get(0)
     local len = offs:get(1) - lo
     if len <= 0 then
@@ -122,6 +123,9 @@ local function create (db, opts)
     if search_stmt:bind_match(2, nbrs, lo, len) == nil then
       search_stmt:reset()
       return {}
+    end
+    if vals then
+      search_stmt:bind_weights(3, vals, lo, len)
     end
     local out = {}
     while true do

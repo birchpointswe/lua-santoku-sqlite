@@ -159,7 +159,7 @@ test("fts: accepts svec neighbors, which is what the tokenizer emits", function 
 
 end)
 
-test("fts: repeated query terms are not deduped, so query tf affects scoring", function ()
+test("fts: float query weights scale a term's contribution", function ()
 
   local db = sql(sqlite.open_memory())
   local idx = fts.create(db, { name = "docs" })
@@ -168,14 +168,33 @@ test("fts: repeated query terms are not deduped, so query tf affects scoring", f
     { "a", "b" },
     mkcsr(
       { 0, 2, 4 },
-      { 1, 2, 1, 3 },
-      { 3, 1, 1, 3 }))
+      { 1, 2, 3, 4 },
+      { 1, 1, 1, 1 }))
 
-  local once = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10)
-  local twice = idx.search(mkcsr({ 0, 2 }, { 1, 1 }, { 1, 1 }), 10)
+  local plain = idx.search(mkcsr({ 0, 2 }, { 1, 3 }, { 1, 1 }), 10)
+  assert(eq(#plain, 2))
 
-  assert(eq(#once, 2))
-  assert(eq(#twice, 2))
-  assert(once[1].score ~= twice[1].score)
+  local boosted = idx.search(mkcsr({ 0, 2 }, { 1, 3 }, { 2.5, 1 }), 10)
+  assert(eq(#boosted, 2))
+  assert(eq(boosted[1].id, "a"))
+
+  local other = idx.search(mkcsr({ 0, 2 }, { 1, 3 }, { 1, 2.5 }), 10)
+  assert(eq(other[1].id, "b"))
+
+end)
+
+test("fts: fractional weights are not rounded", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = fts.create(db, { name = "docs" })
+
+  idx.add({ "a" }, mkcsr({ 0, 1 }, { 1 }, { 1 }))
+
+  local w1 = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1.0 }), 10)
+  local w2 = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1.4 }), 10)
+
+  assert(eq(#w1, 1))
+  assert(eq(#w2, 1))
+  assert(w1[1].score ~= w2[1].score)
 
 end)

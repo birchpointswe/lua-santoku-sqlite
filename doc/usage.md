@@ -164,9 +164,18 @@ Tokenization stays in santoku. A C tokenizer registered as `santoku` receives to
 packed by `stmt:bind_tokens` and emits them directly, so `regions`, `terminals`, `tags`
 and `focus` all still decide what a token is. FTS5 never sees your text.
 
-Ranking is FTS5's `bm25()`, which reads the repeats as term frequency and applies
-document-length normalisation. Do **not** pre-weight the csr with `csr:idf()` or
-`csr:bm25()` here; bm25 does that itself. Scores sort ascending, lower being better.
+Ranking is `santoku_bm25()`, a BM25 implementation registered into FTS5 from C. It takes
+its document statistics from the index and its per-term query weights from you. Scores sort
+ascending, lower being better.
+
+The two sides of the API read their `values` differently, and the difference is worth
+holding onto:
+
+- `add` treats values as **term frequencies**. They are materialised as repeated tokens,
+  which is what an inverted index stores, so pass counts and do **not** pre-weight with
+  `csr:idf()` or `csr:bm25()`. BM25 derives idf and length normalisation itself.
+- `search` treats values as **query weights**, passed through as floats. Leave them at the
+  query's term counts for ordinary use, or raise one to boost a term. Nothing is rounded.
 
 ```lua
 local fts = require("santoku.sqlite.fts")
@@ -197,9 +206,10 @@ idx.clear()
 ```
 
 `opts` takes `name`, an optional `schema`, and an optional `detail` of `full`, `column`
-or `none`. Query terms are OR-ed: the MATCH expression is built in C by
-`stmt:bind_match`, so no caller writes FTS5 query syntax. Re-adding an id replaces it,
-and deletes work because the table is created with `contentless_delete=1`.
+or `none`. Query terms are OR-ed: the MATCH expression is built in C by `stmt:bind_match`
+and the weights bound alongside it by `stmt:bind_weights`, so no caller writes FTS5 query
+syntax. Re-adding an id replaces it, and deletes work because the table is created with
+`contentless_delete=1`.
 
 Anchor: `test/spec/santoku/sqlite/fts.lua`.
 

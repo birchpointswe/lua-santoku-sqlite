@@ -2,6 +2,7 @@
 #include <lauxlib.h>
 #include <sqlite3.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 
 #ifdef __EMSCRIPTEN__
@@ -858,6 +859,7 @@ static luaL_Reg db_methods[] = {
 
 static int stmt_bind_tokens (lua_State *L);
 static int stmt_bind_match (lua_State *L);
+static int stmt_bind_weights (lua_State *L);
 
 static luaL_Reg stmt_methods[] = {
   { "step", stmt_step },
@@ -872,6 +874,7 @@ static luaL_Reg stmt_methods[] = {
   { "bind_carray", stmt_bind_carray },
   { "bind_tokens", stmt_bind_tokens },
   { "bind_match", stmt_bind_match },
+  { "bind_weights", stmt_bind_weights },
   { NULL, NULL }
 };
 
@@ -928,6 +931,127 @@ static fts5_tokenizer tk_fts5_tokenizer = {
   tk_fts5_tok_create, tk_fts5_tok_delete, tk_fts5_tok_tokenize
 };
 
+typedef struct {
+  int nPhrase;
+  double avgdl;
+  double *aIDF;
+  double *aFreq;
+} tk_bm25_data;
+
+static int tk_bm25_count_cb (
+  const Fts5ExtensionApi *api, Fts5Context *fts, void *user
+) {
+  (void) api; (void) fts;
+  (*(sqlite3_int64 *) user) ++;
+  return SQLITE_OK;
+}
+
+static int tk_bm25_get_data (
+  const Fts5ExtensionApi *api, Fts5Context *fts, tk_bm25_data **out
+) {
+  int rc = SQLITE_OK;
+  tk_bm25_data *p = (tk_bm25_data *) api->xGetAuxdata(fts, 0);
+  if (p == NULL) {
+    int nphrase = api->xPhraseCount(fts);
+    sqlite3_int64 nrow = 0, ntoken = 0;
+    sqlite3_int64 nbyte =
+      (sqlite3_int64) sizeof(tk_bm25_data) + (sqlite3_int64) nphrase * 2 * (sqlite3_int64) sizeof(double);
+    p = (tk_bm25_data *) sqlite3_malloc64(nbyte);
+    if (p == NULL)
+      return SQLITE_NOMEM;
+    memset(p, 0, (size_t) nbyte);
+    p->nPhrase = nphrase;
+    p->aIDF = (double *) &p[1];
+    p->aFreq = &p->aIDF[nphrase];
+    rc = api->xRowCount(fts, &nrow);
+    if (rc == SQLITE_OK)
+      rc = api->xColumnTotalSize(fts, -1, &ntoken);
+    if (rc == SQLITE_OK && nrow > 0)
+      p->avgdl = (double) ntoken / (double) nrow;
+    for (int i = 0; rc == SQLITE_OK && i < nphrase; i ++) {
+      sqlite3_int64 nhit = 0;
+      rc = api->xQueryPhrase(fts, i, (void *) &nhit, tk_bm25_count_cb);
+      if (rc == SQLITE_OK) {
+        double idf = log(((double) nrow - (double) nhit + 0.5) / ((double) nhit + 0.5));
+        if (idf <= 0.0)
+          idf = 1e-6;
+        p->aIDF[i] = idf;
+      }
+    }
+    if (rc != SQLITE_OK) {
+      sqlite3_free(p);
+      p = NULL;
+    } else {
+      rc = api->xSetAuxdata(fts, p, sqlite3_free);
+      if (rc != SQLITE_OK)
+        p = NULL;
+    }
+  }
+  *out = p;
+  return rc;
+}
+
+static void tk_bm25_function (
+  const Fts5ExtensionApi *api, Fts5Context *fts, sqlite3_context *ctx,
+  int nval, sqlite3_value **aval
+) {
+  const double k1 = 1.2, b = 0.75;
+  tk_bm25_data *data = NULL;
+  const float *qw = NULL;
+  int nqw = 0, ninst = 0;
+  double score = 0.0, dl = 0.0;
+  int rc = tk_bm25_get_data(api, fts, &data);
+  if (rc == SQLITE_OK && nval > 0 && sqlite3_value_type(aval[0]) == SQLITE_BLOB) {
+    qw = (const float *) sqlite3_value_blob(aval[0]);
+    nqw = sqlite3_value_bytes(aval[0]) / (int) sizeof(float);
+  }
+  if (rc == SQLITE_OK) {
+    memset(data->aFreq, 0, sizeof(double) * (size_t) data->nPhrase);
+    rc = api->xInstCount(fts, &ninst);
+  }
+  for (int i = 0; rc == SQLITE_OK && i < ninst; i ++) {
+    int ip = 0, ic = 0, io = 0;
+    rc = api->xInst(fts, i, &ip, &ic, &io);
+    if (rc == SQLITE_OK && ip >= 0 && ip < data->nPhrase)
+      data->aFreq[ip] += 1.0;
+  }
+  if (rc == SQLITE_OK) {
+    int ntok = 0;
+    rc = api->xColumnSize(fts, -1, &ntok);
+    dl = (double) ntok;
+  }
+  if (rc != SQLITE_OK) {
+    sqlite3_result_error_code(ctx, rc);
+    return;
+  }
+  for (int i = 0; i < data->nPhrase; i ++) {
+    double f = data->aFreq[i];
+    double w = (qw != NULL && i < nqw) ? (double) qw[i] : 1.0;
+    double norm = (data->avgdl > 0.0) ? (1.0 - b + b * dl / data->avgdl) : 1.0;
+    score += w * data->aIDF[i] * ((f * (k1 + 1.0)) / (f + k1 * norm));
+  }
+  sqlite3_result_double(ctx, -1.0 * score);
+}
+
+static int stmt_bind_weights (lua_State *L) {
+  tk_sqlite_stmt *s = check_stmt(L, 1);
+  sqlite3_stmt *h = stmt_handle(L, s, "bind_weights");
+  int pidx = (int) luaL_checkinteger(L, 2);
+  void *vdata; int vcnt, vtype;
+  if (!detect_vec(L, 3, &vdata, &vcnt, &vtype) || vtype != TK_CA_FLOAT)
+    return luaL_error(L, "bind_weights: expected an fvec of query weights");
+  int start = (int) luaL_optinteger(L, 4, 0);
+  int count = (int) luaL_optinteger(L, 5, vcnt - start);
+  if (start < 0 || count < 0 || start > vcnt || count > vcnt - start)
+    return luaL_error(L, "bind_weights: slice [%d,+%d) out of range for length %d",
+      start, count, vcnt);
+  int rc = sqlite3_bind_blob(h, pidx,
+    (const char *) vdata + (size_t) start * sizeof(float),
+    (int) ((size_t) count * sizeof(float)), SQLITE_TRANSIENT);
+  lua_pushinteger(L, rc);
+  return 1;
+}
+
 static void tk_register_fts5 (sqlite3 *raw) {
   fts5_api *api = NULL;
   sqlite3_stmt *st = NULL;
@@ -936,8 +1060,10 @@ static void tk_register_fts5 (sqlite3 *raw) {
   sqlite3_bind_pointer(st, 1, (void *) &api, "fts5_api_ptr", NULL);
   sqlite3_step(st);
   sqlite3_finalize(st);
-  if (api != NULL)
+  if (api != NULL) {
     api->xCreateTokenizer(api, "santoku", NULL, &tk_fts5_tokenizer, NULL);
+    api->xCreateFunction(api, "santoku_bm25", NULL, tk_bm25_function, NULL);
+  }
 }
 
 static int tk_tok_reserve (unsigned char **buf, size_t *n, size_t *cap, size_t extra) {
