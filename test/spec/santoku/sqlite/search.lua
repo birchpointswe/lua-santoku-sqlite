@@ -236,3 +236,61 @@ test("schema: index lives in an attached database", function ()
   assert(eq(#res2, 1))
 
 end)
+
+test("norm = false: raw dot product, no doc table", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = search.create(db, { name = "docs", norm = false })
+
+  idx.add(
+    { "a", "b" },
+    mkcsr(
+      { 0, 3, 5 },
+      { 1, 2, 3, 2, 3 },
+      { 2, 3, 4, 1, 1 }))
+
+  local res = idx.search(mkcsr({ 0, 2 }, { 2, 3 }, { 1, 1 }), 10)
+  local scores = by_id(res)
+  assert(eq(#res, 2))
+  assert(close(scores.a, 7))
+  assert(close(scores.b, 2))
+
+  local ndoc = db.getter(
+    "select count(*) as n from sqlite_master where type = 'table' and name = 'docs_doc'", "n")()
+  assert(eq(ndoc, 0))
+
+  res = idx.search(mkcsr({ 0, 1 }, { 1 }, { 5 }), 10)
+  assert(eq(#res, 1))
+  assert(eq(res[1].id, "a"))
+  assert(close(res[1].score, 10))
+
+  idx.remove({ "a" })
+  res = idx.search(mkcsr({ 0, 2 }, { 2, 3 }, { 1, 1 }), 10)
+  assert(eq(#res, 1))
+  assert(eq(res[1].id, "b"))
+
+  idx.clear()
+  res = idx.search(mkcsr({ 0, 2 }, { 2, 3 }, { 1, 1 }), 10)
+  assert(eq(#res, 0))
+
+end)
+
+test("norm = false: longer documents are not penalised", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = search.create(db, { name = "docs", norm = false })
+
+  idx.add(
+    { "short", "long" },
+    mkcsr(
+      { 0, 1, 6 },
+      { 1, 1, 2, 3, 4, 5 },
+      { 1, 1, 1, 1, 1, 1 }))
+
+  local res = idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10)
+  local scores = by_id(res)
+  assert(eq(#res, 2))
+  assert(close(scores.short, 1))
+  assert(close(scores.long, 1))
+
+end)

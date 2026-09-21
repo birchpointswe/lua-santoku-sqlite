@@ -40,12 +40,10 @@ local function create (db, opts)
   local partition = pname ~= nil
   local weighted = opts.weighted
   if weighted == nil then weighted = true end
+  local norm = opts.norm
+  if norm == nil then norm = true end
+  local usedoc = weighted and norm
   local rawdb = db.db
-
-
-
-
-
 
   local schema = opts.schema
   if schema ~= nil then
@@ -64,7 +62,7 @@ local function create (db, opts)
     (weighted and ", tf real not null" or "") .. ");" ..
     "create index if not exists " .. tbl .. "_tf_tok on " .. name .. "_tf (" .. ppk .. "token);" ..
     "create index if not exists " .. tbl .. "_tf_id on " .. name .. "_tf (" .. ppk .. "id);"
-  if weighted then
+  if usedoc then
     ddl = ddl ..
       "create table if not exists " .. tbl .. "_doc (" .. pcol ..
       "id, norm real not null, primary key (" .. ppk .. "id));"
@@ -81,13 +79,15 @@ local function create (db, opts)
       "insert into " .. tbl .. "_tf (" .. idcols .. "token, tf) " ..
       "select " .. idsel .. ", t.value, count(*) " ..
       "from carray(?" .. tok_p .. ") t group by t.value")
-    insert_doc = rawdb:prepare(
-      "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
-      "select " .. idsel .. ", sqrt(sum(w.value * w.value)) from carray(?" .. tok_p .. ") w")
-    insert_doc_counted = rawdb:prepare(
-      "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
-      "select " .. idsel .. ", sqrt(sum(c * c)) " ..
-      "from (select count(*) c from carray(?" .. tok_p .. ") t group by t.value)")
+    if usedoc then
+      insert_doc = rawdb:prepare(
+        "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
+        "select " .. idsel .. ", sqrt(sum(w.value * w.value)) from carray(?" .. tok_p .. ") w")
+      insert_doc_counted = rawdb:prepare(
+        "insert into " .. tbl .. "_doc (" .. idcols .. "norm) " ..
+        "select " .. idsel .. ", sqrt(sum(c * c)) " ..
+        "from (select count(*) c from carray(?" .. tok_p .. ") t group by t.value)")
+    end
   else
     insert_tf = rawdb:prepare(
       "insert into " .. tbl .. "_tf (" .. idcols .. "token) " ..
@@ -97,11 +97,26 @@ local function create (db, opts)
   local s_limit_p = partition and 2 or 1
   local s_qtok_p = partition and 3 or 2
   local s_qval_p = s_qtok_p + 1
-  local docjoin = "join " .. tbl .. "_doc d on " ..
-    (partition and ("d." .. pname .. " = s." .. pname .. " and ") or "") .. "d.id = s.id "
+  local docjoin = usedoc and ("join " .. tbl .. "_doc d on " ..
+    (partition and ("d." .. pname .. " = s." .. pname .. " and ") or "") .. "d.id = s.id ") or ""
   local pwhere = partition and ("where s." .. pname .. " = ?1 ") or ""
   local search_stmt, search_stmt_counted
-  if weighted then
+  if weighted and not usedoc then
+    search_stmt = rawdb:prepare(
+      "select s.id as id, sum(s.tf * q.tf) as score " ..
+      "from " .. tbl .. "_tf s " ..
+      "join (select t.value as token, w.value as tf from carray(?" .. s_qtok_p .. ") t " ..
+      "join carray(?" .. s_qval_p .. ") w on t.rowid = w.rowid) q on s.token = q.token " ..
+      pwhere ..
+      "group by s.id order by score desc limit ?" .. s_limit_p)
+    search_stmt_counted = rawdb:prepare(
+      "select s.id as id, sum(s.tf * q.tf) as score " ..
+      "from " .. tbl .. "_tf s " ..
+      "join (select t.value as token, count(*) as tf from carray(?" .. s_qtok_p .. ") t " ..
+      "group by t.value) q on s.token = q.token " ..
+      pwhere ..
+      "group by s.id order by score desc limit ?" .. s_limit_p)
+  elseif weighted then
     search_stmt = rawdb:prepare(
       "select s.id as id, sum(s.tf * q.tf) / " ..
       "(d.norm * (select sqrt(sum(value * value)) from carray(?" .. s_qval_p .. "))) as score " ..
@@ -132,14 +147,14 @@ local function create (db, opts)
   if partition then
     del_tf = db.runner("delete from " .. tbl .. "_tf where " .. pname .. " = ?1 and id = ?2")
     clear_tf = db.runner("delete from " .. tbl .. "_tf where " .. pname .. " = ?1")
-    if weighted then
+    if usedoc then
       del_doc = db.runner("delete from " .. tbl .. "_doc where " .. pname .. " = ?1 and id = ?2")
       clear_doc = db.runner("delete from " .. tbl .. "_doc where " .. pname .. " = ?1")
     end
   else
     del_tf = db.runner("delete from " .. tbl .. "_tf where id = ?1")
     clear_tf = db.runner("delete from " .. tbl .. "_tf")
-    if weighted then
+    if usedoc then
       del_doc = db.runner("delete from " .. tbl .. "_doc where id = ?1")
       clear_doc = db.runner("delete from " .. tbl .. "_doc")
     end
@@ -147,7 +162,7 @@ local function create (db, opts)
 
   local function del_one (part, id)
     if partition then del_tf(part, id) else del_tf(id) end
-    if weighted then
+    if usedoc then
       if partition then del_doc(part, id) else del_doc(id) end
     end
   end
@@ -187,19 +202,23 @@ local function create (db, opts)
         insert_tf:bind_carray(tok_p, toks, lo, len)
         insert_tf:bind_carray(tok_p + 1, vals, lo, len)
         drive(rawdb, insert_tf)
-        insert_doc:reset()
-        bind_id(insert_doc, part, id)
-        insert_doc:bind_carray(tok_p, vals, lo, len)
-        drive(rawdb, insert_doc)
+        if usedoc then
+          insert_doc:reset()
+          bind_id(insert_doc, part, id)
+          insert_doc:bind_carray(tok_p, vals, lo, len)
+          drive(rawdb, insert_doc)
+        end
       else
         insert_tf_counted:reset()
         bind_id(insert_tf_counted, part, id)
         insert_tf_counted:bind_carray(tok_p, toks, lo, len)
         drive(rawdb, insert_tf_counted)
-        insert_doc_counted:reset()
-        bind_id(insert_doc_counted, part, id)
-        insert_doc_counted:bind_carray(tok_p, toks, lo, len)
-        drive(rawdb, insert_doc_counted)
+        if usedoc then
+          insert_doc_counted:reset()
+          bind_id(insert_doc_counted, part, id)
+          insert_doc_counted:bind_carray(tok_p, toks, lo, len)
+          drive(rawdb, insert_doc_counted)
+        end
       end
     end
   end
@@ -216,10 +235,10 @@ local function create (db, opts)
   local function clear (part)
     if partition then
       clear_tf(part)
-      if weighted then clear_doc(part) end
+      if usedoc then clear_doc(part) end
     else
       clear_tf()
-      if weighted then clear_doc() end
+      if usedoc then clear_doc() end
     end
   end
 
