@@ -51,7 +51,8 @@ local function create (db, opts)
   local ins_ft = rawdb:prepare(
     "insert into " .. tbl .. "_ft (rowid, body) values (?1, ?2)")
   local search_stmt = rawdb:prepare(
-    "select m.id as id, santoku_bm25(" .. name .. "_ft, ?3) as score " ..
+    "select m.id as id, santoku_bm25(" .. name .. "_ft, ?3) as score, " ..
+    "santoku_bm25_max(" .. name .. "_ft, ?3) as maxw " ..
     "from " .. tbl .. "_ft join " .. tbl .. "_map m on m.rid = " .. name .. "_ft.rowid " ..
     "where " .. name .. "_ft match ?2 order by score limit ?1")
 
@@ -131,7 +132,11 @@ local function create (db, opts)
     while true do
       local res = search_stmt:step()
       if res == ROW then
-        out[#out + 1] = search_stmt:get_named_values()
+        local row = search_stmt:get_named_values()
+        local c = row.maxw > 0 and -row.score / row.maxw or 0
+        row.coverage = c > 1 and 1 or c
+        row.maxw = nil
+        out[#out + 1] = row
       elseif res == DONE then
         search_stmt:reset()
         break

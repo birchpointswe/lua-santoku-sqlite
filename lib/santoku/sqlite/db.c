@@ -1033,6 +1033,30 @@ static void tk_bm25_function (
   sqlite3_result_double(ctx, -1.0 * score);
 }
 
+static void tk_bm25_max_function (
+  const Fts5ExtensionApi *api, Fts5Context *fts, sqlite3_context *ctx,
+  int nval, sqlite3_value **aval
+) {
+  tk_bm25_data *data = NULL;
+  const float *qw = NULL;
+  int nqw = 0;
+  double maxw = 0.0;
+  int rc = tk_bm25_get_data(api, fts, &data);
+  if (rc != SQLITE_OK) {
+    sqlite3_result_error_code(ctx, rc);
+    return;
+  }
+  if (nval > 0 && sqlite3_value_type(aval[0]) == SQLITE_BLOB) {
+    qw = (const float *) sqlite3_value_blob(aval[0]);
+    nqw = sqlite3_value_bytes(aval[0]) / (int) sizeof(float);
+  }
+  for (int i = 0; i < data->nPhrase; i ++) {
+    double w = (qw != NULL && i < nqw) ? (double) qw[i] : 1.0;
+    maxw += w * data->aIDF[i];
+  }
+  sqlite3_result_double(ctx, maxw);
+}
+
 static int stmt_bind_weights (lua_State *L) {
   tk_sqlite_stmt *s = check_stmt(L, 1);
   sqlite3_stmt *h = stmt_handle(L, s, "bind_weights");
@@ -1063,6 +1087,7 @@ static void tk_register_fts5 (sqlite3 *raw) {
   if (api != NULL) {
     api->xCreateTokenizer(api, "santoku", NULL, &tk_fts5_tokenizer, NULL);
     api->xCreateFunction(api, "santoku_bm25", NULL, tk_bm25_function, NULL);
+    api->xCreateFunction(api, "santoku_bm25_max", NULL, tk_bm25_max_function, NULL);
   }
 }
 
