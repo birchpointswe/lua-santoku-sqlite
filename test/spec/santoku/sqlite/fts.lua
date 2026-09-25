@@ -213,6 +213,48 @@ test("fts: coverage is the score over the weighted idf sum, clamped to 1", funct
 
 end)
 
+test("fts: rebuild swaps in a new index built in batches", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = fts.create(db, { name = "docs" })
+
+  idx.add({ "a", "b" }, mkcsr({ 0, 1, 2 }, { 1, 2 }, { 1, 1 }))
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10), 1))
+
+  idx.rebuild({ "c", "d", "e" }, mkcsr({ 0, 1, 2, 3 }, { 3, 3, 4 }, { 1, 1, 1 }), 2)
+
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10), 0))
+  local ids = ids_of(idx.search(mkcsr({ 0, 1 }, { 3 }, { 1 }), 10))
+  assert(ids.c and ids.d and not ids.a)
+
+  idx.add({ "f" }, mkcsr({ 0, 1 }, { 4 }, { 1 }))
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 4 }, { 1 }), 10), 2))
+
+  local leftover = db.getter(
+    "select count(*) as n from sqlite_master where name like 'docs_new%' or name like 'docs_old%'", "n")
+  assert(eq(leftover(), 0))
+
+end)
+
+test("fts: a failed rebuild leaves the live index intact", function ()
+
+  local db = sql(sqlite.open_memory())
+  local idx = fts.create(db, { name = "docs" })
+
+  idx.add({ "a" }, mkcsr({ 0, 1 }, { 1 }, { 1 }))
+
+  local ok = err.pcall(function ()
+    idx.rebuild({ "x", "y" }, mkcsr({ 0, 1, 1 }, { 2 }, { 1 }), 1)
+  end)
+  assert(eq(ok, false))
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10), 1))
+
+  idx.rebuild({ "z" }, mkcsr({ 0, 1 }, { 5 }, { 1 }))
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 5 }, { 1 }), 10), 1))
+  assert(eq(#idx.search(mkcsr({ 0, 1 }, { 1 }, { 1 }), 10), 0))
+
+end)
+
 test("fts: fractional weights are not rounded", function ()
 
   local db = sql(sqlite.open_memory())

@@ -36,11 +36,14 @@ local function create (db, opts)
   local tbl = schema and (schema .. "." .. name) or name
   local rawdb = db.db
 
-  db.exec(
-    "create table if not exists " .. tbl .. "_map (rid integer primary key, id text unique);" ..
-    "create virtual table if not exists " .. tbl .. "_ft using fts5(" ..
-    "body, content='', contentless_delete=1, tokenize='santoku', detail=" ..
-    detail .. ");")
+  local function ddl (t, guard)
+    return "create table " .. guard .. t .. "_map (rid integer primary key, id text unique);" ..
+      "create virtual table " .. guard .. t .. "_ft using fts5(" ..
+      "body, content='', contentless_delete=1, tokenize='santoku', detail=" ..
+      detail .. ");"
+  end
+
+  db.exec(ddl(tbl, "if not exists "))
 
   local get_rid = db.getter("select rid as rid from " .. tbl .. "_map where id = ?1", "rid")
   local put_id = db.inserter("insert into " .. tbl .. "_map (id) values (?1)")
@@ -110,6 +113,50 @@ local function create (db, opts)
     clear_map()
   end
 
+  local function rebuild (ids, csr, batch)
+    assert(type(ids) == "table", "fts.rebuild: ids must be a list")
+    batch = batch or 5000
+    local offs = csr:offsets()
+    local nbrs = csr:neighbors()
+    local vals = csr:values()
+    local ndocs = offs:size() - 1
+    if #ids ~= ndocs then
+      return error("fts.rebuild: ids length (" .. #ids ..
+        ") does not match CSR rows (" .. ndocs .. ")")
+    end
+    local new, old = tbl .. "_new", tbl .. "_old"
+    db.exec(
+      "drop table if exists " .. new .. "_ft; drop table if exists " .. new .. "_map;" ..
+      "drop table if exists " .. old .. "_ft; drop table if exists " .. old .. "_map;")
+    db.exec(ddl(new, ""))
+    local put_new = db.inserter("insert into " .. new .. "_map (id) values (?1)")
+    local ins_new = rawdb:prepare("insert into " .. new .. "_ft (rowid, body) values (?1, ?2)")
+    for first = 0, ndocs - 1, batch do
+      local last = first + batch < ndocs and first + batch or ndocs
+      db.transaction(function ()
+        for i = first, last - 1 do
+          local lo = offs:get(i)
+          local len = offs:get(i + 1) - lo
+          if len <= 0 then
+            return error("fts.rebuild: empty token row at id index " .. (i + 1))
+          end
+          ins_new:reset()
+          ins_new:bind_values(put_new(ids[i + 1]))
+          ins_new:bind_tokens(2, nbrs, vals, lo, len)
+          drive(rawdb, ins_new)
+        end
+      end)
+    end
+    db.transaction(function ()
+      db.exec(
+        "alter table " .. tbl .. "_map rename to " .. name .. "_old_map;" ..
+        "alter table " .. tbl .. "_ft rename to " .. name .. "_old_ft;" ..
+        "alter table " .. new .. "_map rename to " .. name .. "_map;" ..
+        "alter table " .. new .. "_ft rename to " .. name .. "_ft;")
+    end)
+    db.exec("drop table " .. old .. "_ft; drop table " .. old .. "_map;")
+  end
+
   local function search (csr, limit)
     local offs = csr:offsets()
     local nbrs = csr:neighbors()
@@ -153,6 +200,7 @@ local function create (db, opts)
     add = add,
     remove = remove,
     clear = clear,
+    rebuild = rebuild,
     search = search,
   }
 end
