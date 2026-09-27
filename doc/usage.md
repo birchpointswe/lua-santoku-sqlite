@@ -173,7 +173,7 @@ holding onto:
 
 - `add` treats values as **term frequencies**. They are materialised as repeated tokens,
   which is what an inverted index stores, so pass counts and do **not** pre-weight with
-  `csr:idf()` or `csr:bm25()`. BM25 derives idf and length normalisation itself.
+  `csr:bm25()`. BM25 derives idf and length normalisation itself.
 - `search` treats values as **query weights**, passed through as floats. Leave them at the
   query's term counts for ordinary use, or raise one to boost a term. Nothing is rounded.
 
