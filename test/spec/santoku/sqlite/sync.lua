@@ -834,6 +834,102 @@ test("sqlite.sync", function ()
     assert(eq(a.has("t9", "i9"), 1))
   end)
 
+  test("schema qualified tables sync inside an attached database", function ()
+    local function apeer (schema)
+      local db = sql(sqlite.open_memory())
+      db.exec("attach database ':memory:' as " .. schema)
+      db.exec("create table " .. schema .. ".notes (id text primary key, title text)")
+      local s = sync.create(db, {
+        space = "t", schema = schema,
+        tables = { notes = { pk = { "id" }, columns = { "title" } } },
+      })
+      return {
+        db = db,
+        sync = s,
+        add = db.runner("insert into " .. schema .. ".notes (id, title) values (?1, ?2)"),
+        get = db.getter("select title from " .. schema .. ".notes where id = ?1"),
+        count = db.getter("select count(*) from " .. schema .. ".notes"),
+      }
+    end
+    local a = apeer("x")
+    local b = apeer("y")
+    a.add("n1", "one")
+    local pushed = a.sync.push("b")
+    assert(eq(#pushed.changes, 1))
+    assert(eq(pushed.changes[1].vals.title, "one"))
+    assert(eq(pull(b, a).applied, 1))
+    assert(eq(b.get("n1"), "one"))
+    b.db.exec("update y.notes set title = 'uno' where id = 'n1'")
+    assert(eq(pull(a, b).applied, 1))
+    assert(eq(a.get("n1"), "uno"))
+    b.db.exec("delete from y.notes where id = 'n1'")
+    assert(eq(pull(a, b).applied, 1))
+    assert(eq(a.count(), 0))
+  end)
+
+  test("same table name across main and attached schemas keeps separate syncs", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("attach database ':memory:' as x; attach database ':memory:' as y")
+    local S = {}
+    for _, sc in ipairs({ "main", "x", "y" }) do
+      db.exec("create table " .. sc .. ".notes (id text primary key, title text)")
+      db.exec("insert into " .. sc .. ".notes (id, title) values ('seed-" .. sc .. "', 't')")
+      S[sc] = sync.create(db, {
+        space = "t", schema = sc ~= "main" and sc or nil,
+        tables = { notes = { pk = { "id" }, columns = { "title" } } },
+      })
+    end
+    db.exec("insert into x.notes (id, title) values ('n1', 'one')")
+    local function titles (sc)
+      local out, n = {}, 0
+      for _, c in ipairs(S[sc].push("p").changes) do
+        if c.del then
+          out[c.rid] = false
+        else
+          out[c.rid] = c.vals.title
+        end
+        n = n + 1
+      end
+      return out, n
+    end
+    local m1, mn = titles("main")
+    assert(eq(mn, 1) and eq(m1['["seed-main"]'], "t"))
+    local x1, xn = titles("x")
+    assert(eq(xn, 2) and eq(x1['["seed-x"]'], "t") and eq(x1['["n1"]'], "one"))
+    local y1, yn = titles("y")
+    assert(eq(yn, 1) and eq(y1['["seed-y"]'], "t"))
+    db.exec("update y.notes set title = 'yy' where id = 'seed-y'")
+    db.exec("delete from x.notes where id = 'n1'")
+    local y2, yn2 = titles("y")
+    assert(eq(yn2, 1) and eq(y2['["seed-y"]'], "yy"))
+    local m2, mn2 = titles("main")
+    assert(eq(mn2, 1) and eq(m2['["seed-main"]'], "t"))
+    local x2, xn2 = titles("x")
+    assert(eq(xn2, 2) and eq(x2['["seed-x"]'], "t") and eq(x2['["n1"]'], false))
+  end)
+
+  test("repeated create leaves unchanged triggers in place", function ()
+    local db = sql(sqlite.open_memory())
+    db.exec("attach database ':memory:' as x")
+    db.exec("create table x.notes (id text primary key, title text, body text)")
+    local rowid = db.getter(
+      "select rowid from x.sqlite_master where type = 'trigger' and name = ?1")
+    local opts = { space = "t", schema = "x",
+      tables = { notes = { pk = { "id" }, columns = { "title" } } } }
+    sync.create(db, opts)
+    local ai, au, ad = rowid("notes_sync_ai"), rowid("notes_sync_au"), rowid("notes_sync_ad")
+    assert(ai and au and ad)
+    sync.create(db, opts)
+    assert(eq(rowid("notes_sync_ai"), ai))
+    assert(eq(rowid("notes_sync_au"), au))
+    assert(eq(rowid("notes_sync_ad"), ad))
+    opts.tables.notes.columns = { "title", "body" }
+    sync.create(db, opts)
+    assert(eq(rowid("notes_sync_ai"), ai))
+    assert(rowid("notes_sync_au") ~= au)
+    assert(eq(rowid("notes_sync_ad"), ad))
+  end)
+
   test("column granularity refuses empty columns", function ()
     local db = sql(sqlite.open_memory())
     db.exec("create table m (a text primary key)")

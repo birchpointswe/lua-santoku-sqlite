@@ -440,7 +440,12 @@ static int db_reset_cache (lua_State *L) {
   while ((s = sqlite3_next_stmt(db->handle, s)) != NULL)
     sqlite3_reset(s);
 #ifdef SQLITE_FCNTL_RESET_CACHE
-  sqlite3_file_control(db->handle, "main", SQLITE_FCNTL_RESET_CACHE, NULL);
+  for (int i = 0; ; i ++) {
+    const char *name = sqlite3_db_name(db->handle, i);
+    if (!name)
+      break;
+    sqlite3_file_control(db->handle, name, SQLITE_FCNTL_RESET_CACHE, NULL);
+  }
 #endif
   return 0;
 }
@@ -1652,6 +1657,7 @@ EM_JS(void, tk_sah_setup, (), {
     slot.sah.flush();
     slot.path = "";
     slot.flags = 0;
+    slot.open = false;
     delete C.pathMap[path];
     return true;
   };
@@ -1666,8 +1672,12 @@ EM_JS(void, tk_sah_setup, (), {
 EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
   var C = Module._coop;
   var path = UTF8ToString(cpath);
-  if (path in C.pathMap)
+  if (path in C.pathMap) {
+    var cur = C.files[C.pathMap[path]];
+    if (cur.open) return -1;
+    cur.open = true;
     return C.pathMap[path];
+  }
 
   if (!C.held) return -1;
   for (var i = 0; i < C.files.length; i++) {
@@ -1675,6 +1685,7 @@ EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
       var slot = C.files[i];
       slot.path = path;
       slot.flags = flags;
+      slot.open = true;
       C.pathMap[path] = i;
       var hdr = new Uint8Array(4096);
       for (var j = 0; j < path.length && j < 512; j++)
@@ -1692,6 +1703,8 @@ EM_JS(int, tk_sah_xopen, (const char *cpath, int flags), {
 });
 
 EM_JS(void, tk_sah_xclose, (int fid), {
+  var C = Module._coop;
+  if (C && C.files[fid]) C.files[fid].open = false;
 });
 
 EM_JS(int, tk_sah_xread, (int fid, unsigned char *buf, int n, double off), {
@@ -1763,6 +1776,7 @@ EM_JS(void, tk_sah_xdelete, (const char *cpath), {
   slot.sah.flush();
   slot.path = "";
   slot.flags = 0;
+  slot.open = false;
   delete C.pathMap[path];
 });
 

@@ -147,11 +147,14 @@ local function create (db, opts)
   arr.sort(names)
 
   local q = schema and (schema .. ".") or ""
-  local meta = q .. prefix .. "_meta"
+  local meta_t = prefix .. "_meta"
+  local meta = q .. meta_t
   local peers_tbl = q .. prefix .. "_peer"
 
-  local function shadow_of (name) return q .. name .. "_" .. prefix end
-  local function colshadow_of (name) return q .. name .. "_" .. prefix .. "_col" end
+  local function shadow_t (name) return name .. "_" .. prefix end
+  local function colshadow_t (name) return name .. "_" .. prefix .. "_col" end
+  local function shadow_of (name) return q .. shadow_t(name) end
+  local function colshadow_of (name) return q .. colshadow_t(name) end
   local function base_of (name) return q .. name end
 
   local function rid_expr (name, alias)
@@ -162,109 +165,120 @@ local function create (db, opts)
     return "json_array(" .. arr.concat(parts, ", ") .. ")"
   end
 
-  db.exec(
-    "create table if not exists " .. meta .. " (" ..
-    "id integer primary key check (id = 1), " ..
-    "replica text not null, seq integer not null default 0, " ..
-    "applying integer not null default 0, pt integer not null default 0, " ..
-    "c integer not null default 0, gc_hlc text, " ..
-    "gc_seq integer not null default 0);" ..
-    "insert or ignore into " .. meta .. " (id, replica) values (1, lower(hex(randomblob(16))));" ..
-    "create table if not exists " .. peers_tbl .. " (" ..
-    "peer text primary key, cursor integer not null default 0, " ..
-    "served integer not null default 0);")
+  local get_trigger_sql = db.getter(
+    "select sql from " .. q .. "sqlite_master where type = 'trigger' and name = ?1")
+
+  local function ensure_trigger (tname, decl)
+    if get_trigger_sql(tname) == "CREATE TRIGGER " .. decl then return end
+    db.exec(
+      "drop trigger if exists " .. q .. tname .. ";" ..
+      "create trigger " .. q .. decl .. ";")
+  end
 
   local stamp =
-    "update " .. meta .. " set seq = seq + 1, " ..
+    "update " .. meta_t .. " set seq = seq + 1, " ..
     "c = case when " .. NOW .. " > pt then 0 else c + 1 end, " ..
     "pt = max(pt, " .. NOW .. ") where id = 1;"
 
-  local guard = "when (select applying from " .. meta .. " where id = 1) = 0"
+  local guard = "when (select applying from " .. meta_t .. " where id = 1) = 0"
 
-  for _, name in ipairs(names) do
-    local spec = specs[name]
-    local shadow = shadow_of(name)
-    local colshadow = colshadow_of(name)
-    local rnew = rid_expr(name, "new")
-    local rold = rid_expr(name, "old")
-    local column = spec.granularity == "column"
-
-    local ddl =
-      "create table if not exists " .. shadow .. " (" ..
-      "rid text primary key, hlc text not null, seq integer not null, " ..
-      "del integer not null default 0);" ..
-      "create index if not exists " .. q .. name .. "_" .. prefix .. "_seq on " ..
-      name .. "_" .. prefix .. " (seq);" ..
-      "create index if not exists " .. q .. name .. "_" .. prefix .. "_rid on " ..
-      name .. " (" .. rid_expr(name) .. ");"
-    if column then
-      ddl = ddl ..
-        "create table if not exists " .. colshadow .. " (" ..
-        "rid text not null, col text not null, hlc text not null, " ..
-        "primary key (rid, col));"
-    end
-    db.exec(ddl)
-
-    local watch = {}
-    for _, c in ipairs(spec.pk) do watch[#watch + 1] = c end
-    for _, c in ipairs(spec.columns) do watch[#watch + 1] = c end
-
-    local function upsert_row (rid, del)
-      return
-        "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
-        "select " .. rid .. ", " .. HLCX .. ", seq, " .. del .. " from " .. meta .. " where id = 1 " ..
-        "on conflict (rid) do update set hlc = excluded.hlc, seq = excluded.seq, del = excluded.del;"
-    end
-
-    local ins_body = stamp .. upsert_row(rnew, 0)
-    if column then
-      ins_body = ins_body .. "delete from " .. colshadow .. " where rid = " .. rnew .. ";"
-      for _, c in ipairs(spec.columns) do
-        ins_body = ins_body ..
-          "insert into " .. colshadow .. " (rid, col, hlc) " ..
-          "select " .. rnew .. ", '" .. c .. "', " .. HLCX .. " from " .. meta .. " where id = 1 " ..
-          "on conflict (rid, col) do update set hlc = excluded.hlc;"
-      end
-    end
-
-    local upd_body = stamp ..
-      "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
-      "select " .. rold .. ", " .. HLCX .. ", seq, 1 from " .. meta .. " " ..
-      "where id = 1 and " .. rold .. " is not " .. rnew .. " " ..
-      "on conflict (rid) do update set hlc = excluded.hlc, seq = excluded.seq, del = 1;"
-    if column then
-      upd_body = upd_body ..
-        "delete from " .. colshadow .. " where rid = " .. rold ..
-        " and " .. rold .. " is not " .. rnew .. ";"
-    end
-    upd_body = upd_body .. upsert_row(rnew, 0)
-    if column then
-      for _, c in ipairs(spec.columns) do
-        upd_body = upd_body ..
-          "insert into " .. colshadow .. " (rid, col, hlc) " ..
-          "select " .. rnew .. ", '" .. c .. "', " .. HLCX .. " from " .. meta .. " " ..
-          "where id = 1 and new." .. c .. " is not old." .. c .. " " ..
-          "on conflict (rid, col) do update set hlc = excluded.hlc;"
-      end
-    end
-
-    local del_body = stamp .. upsert_row(rold, 1)
-    if column then
-      del_body = del_body .. "delete from " .. colshadow .. " where rid = " .. rold .. ";"
-    end
+  db.transaction(function ()
 
     db.exec(
-      "drop trigger if exists " .. q .. name .. "_" .. prefix .. "_ai;" ..
-      "create trigger " .. q .. name .. "_" .. prefix .. "_ai after insert on " .. name .. " " ..
-      guard .. " begin " .. ins_body .. " end;" ..
-      "drop trigger if exists " .. q .. name .. "_" .. prefix .. "_au;" ..
-      "create trigger " .. q .. name .. "_" .. prefix .. "_au after update of " ..
-      arr.concat(watch, ", ") .. " on " .. name .. " " ..
-      guard .. " begin " .. upd_body .. " end;" ..
-      "drop trigger if exists " .. q .. name .. "_" .. prefix .. "_ad;" ..
-      "create trigger " .. q .. name .. "_" .. prefix .. "_ad after delete on " .. name .. " " ..
-      guard .. " begin " .. del_body .. " end;")
-  end
+      "create table if not exists " .. meta .. " (" ..
+      "id integer primary key check (id = 1), " ..
+      "replica text not null, seq integer not null default 0, " ..
+      "applying integer not null default 0, pt integer not null default 0, " ..
+      "c integer not null default 0, gc_hlc text, " ..
+      "gc_seq integer not null default 0);" ..
+      "insert or ignore into " .. meta .. " (id, replica) values (1, lower(hex(randomblob(16))));" ..
+      "create table if not exists " .. peers_tbl .. " (" ..
+      "peer text primary key, cursor integer not null default 0, " ..
+      "served integer not null default 0);")
+
+    for _, name in ipairs(names) do
+      local spec = specs[name]
+      local shadow = shadow_t(name)
+      local colshadow = colshadow_t(name)
+      local rnew = rid_expr(name, "new")
+      local rold = rid_expr(name, "old")
+      local column = spec.granularity == "column"
+
+      local ddl =
+        "create table if not exists " .. q .. shadow .. " (" ..
+        "rid text primary key, hlc text not null, seq integer not null, " ..
+        "del integer not null default 0);" ..
+        "create index if not exists " .. q .. shadow .. "_seq on " .. shadow .. " (seq);" ..
+        "create index if not exists " .. q .. shadow .. "_rid on " ..
+        name .. " (" .. rid_expr(name) .. ");"
+      if column then
+        ddl = ddl ..
+          "create table if not exists " .. q .. colshadow .. " (" ..
+          "rid text not null, col text not null, hlc text not null, " ..
+          "primary key (rid, col));"
+      end
+      db.exec(ddl)
+
+      local watch = {}
+      for _, c in ipairs(spec.pk) do watch[#watch + 1] = c end
+      for _, c in ipairs(spec.columns) do watch[#watch + 1] = c end
+
+      local function upsert_row (rid, del)
+        return
+          "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
+          "select " .. rid .. ", " .. HLCX .. ", seq, " .. del .. " from " .. meta_t .. " where id = 1 " ..
+          "on conflict (rid) do update set hlc = excluded.hlc, seq = excluded.seq, del = excluded.del;"
+      end
+
+      local ins_body = stamp .. upsert_row(rnew, 0)
+      if column then
+        ins_body = ins_body .. "delete from " .. colshadow .. " where rid = " .. rnew .. ";"
+        for _, c in ipairs(spec.columns) do
+          ins_body = ins_body ..
+            "insert into " .. colshadow .. " (rid, col, hlc) " ..
+            "select " .. rnew .. ", '" .. c .. "', " .. HLCX .. " from " .. meta_t .. " where id = 1 " ..
+            "on conflict (rid, col) do update set hlc = excluded.hlc;"
+        end
+      end
+
+      local upd_body = stamp ..
+        "insert into " .. shadow .. " (rid, hlc, seq, del) " ..
+        "select " .. rold .. ", " .. HLCX .. ", seq, 1 from " .. meta_t .. " " ..
+        "where id = 1 and " .. rold .. " is not " .. rnew .. " " ..
+        "on conflict (rid) do update set hlc = excluded.hlc, seq = excluded.seq, del = 1;"
+      if column then
+        upd_body = upd_body ..
+          "delete from " .. colshadow .. " where rid = " .. rold ..
+          " and " .. rold .. " is not " .. rnew .. ";"
+      end
+      upd_body = upd_body .. upsert_row(rnew, 0)
+      if column then
+        for _, c in ipairs(spec.columns) do
+          upd_body = upd_body ..
+            "insert into " .. colshadow .. " (rid, col, hlc) " ..
+            "select " .. rnew .. ", '" .. c .. "', " .. HLCX .. " from " .. meta_t .. " " ..
+            "where id = 1 and new." .. c .. " is not old." .. c .. " " ..
+            "on conflict (rid, col) do update set hlc = excluded.hlc;"
+        end
+      end
+
+      local del_body = stamp .. upsert_row(rold, 1)
+      if column then
+        del_body = del_body .. "delete from " .. colshadow .. " where rid = " .. rold .. ";"
+      end
+
+      ensure_trigger(shadow .. "_ai",
+        shadow .. "_ai after insert on " .. name .. " " ..
+        guard .. " begin " .. ins_body .. " end")
+      ensure_trigger(shadow .. "_au",
+        shadow .. "_au after update of " .. arr.concat(watch, ", ") .. " on " .. name .. " " ..
+        guard .. " begin " .. upd_body .. " end")
+      ensure_trigger(shadow .. "_ad",
+        shadow .. "_ad after delete on " .. name .. " " ..
+        guard .. " begin " .. del_body .. " end")
+    end
+
+  end)
 
   local get_replica = db.getter("select replica from " .. meta .. " where id = 1")
   local get_seq = db.getter("select seq from " .. meta .. " where id = 1")
@@ -325,30 +339,18 @@ local function create (db, opts)
       sel[i] = spec.blob[c] and ("hex(b." .. c .. ") as " .. c) or ("b." .. c .. " as " .. c)
     end
 
-    local enum_live = db.all(
+    local nulls = {}
+    for i = 1, #all_cols do nulls[i] = "null" end
+
+    local enum = db.all(
       "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
       arr.concat(sel, ", ") ..
       " from " .. shadow .. " s join " .. base .. " b on " ..
       rid_expr(name, "b") .. " = s.rid " ..
-      "where s.del = 0 and s.seq > ?1 order by s.seq limit ?2", true)
-
-    local enum_dead = db.all(
-      "select rid, hlc, seq, 1 as del from " .. shadow ..
-      " where del = 1 and seq > ?1 order by seq limit ?2", true)
-
-    local function enum (from, lim)
-      local out = enum_live(from, lim)
-      for _, r in ipairs(enum_dead(from, lim)) do
-        out[#out + 1] = r
-      end
-      arr.sort(out, function (a, b) return a.seq < b.seq end)
-      if #out > lim then
-        local cut = {}
-        for i = 1, lim do cut[i] = out[i] end
-        return cut
-      end
-      return out
-    end
+      "where s.del = 0 and s.seq > ?1 " ..
+      "union all select rid, hlc, seq, 1 as del, " .. arr.concat(nulls, ", ") ..
+      " from " .. shadow .. " where del = 1 and seq > ?1 " ..
+      "order by seq limit ?2", true)
 
     local fetch_live = db.all(
       "select s.rid as rid, s.hlc as hlc, s.seq as seq, 0 as del, " ..
@@ -421,7 +423,7 @@ local function create (db, opts)
         "select " .. rid_q .. ", " .. minted_hlc .. ", " ..
         "(select seq from " .. meta .. " where id = 1) + " ..
         "row_number() over (order by " .. arr.concat(spec.pk, ", ") .. "), 0 " ..
-        "from " .. name .. " where not exists (select 1 from " .. shadow ..
+        "from " .. base .. " where not exists (select 1 from " .. shadow ..
         " s where s.rid = " .. rid_q .. ")"),
       max_hlc = spec.seed and db.getter("select max(hlc) from " .. shadow) or nil,
       backfill_cols = column and db.runner(
