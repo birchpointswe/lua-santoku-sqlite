@@ -33,6 +33,10 @@ local function create (db, opts)
   local detail = opts.detail or "full"
   assert(detail == "full" or detail == "column" or detail == "none",
     "fts.create: opts.detail must be full, column or none")
+  local k1 = opts.k1 or 1.2
+  local b = opts.b or 0.75
+  assert(type(k1) == "number" and k1 >= 0, "fts.create: opts.k1 must be a number >= 0")
+  assert(type(b) == "number" and b >= 0 and b <= 1, "fts.create: opts.b must be a number in [0, 1]")
   local tbl = schema and (schema .. "." .. name) or name
   local rawdb = db.db
 
@@ -54,10 +58,10 @@ local function create (db, opts)
   local ins_ft = rawdb:prepare(
     "insert into " .. tbl .. "_ft (rowid, body) values (?1, ?2)")
   local search_stmt = rawdb:prepare(
-    "select m.id as id, santoku_bm25(" .. name .. "_ft, ?3) as score, " ..
-    "santoku_bm25_max(" .. name .. "_ft, ?3) as maxw " ..
+    "select m.id as id, santoku_bm25(" .. name .. "_ft, ?5, ?2, ?3) as score, " ..
+    "santoku_bm25_max(" .. name .. "_ft, ?5) as maxw " ..
     "from " .. tbl .. "_ft join " .. tbl .. "_map m on m.rid = " .. name .. "_ft.rowid " ..
-    "where " .. name .. "_ft match ?2 order by score limit ?1")
+    "where " .. name .. "_ft match ?4 order by score limit ?1")
 
   local function rid_for (id)
     local rid = get_rid(id)
@@ -167,13 +171,13 @@ local function create (db, opts)
       return {}
     end
     search_stmt:reset()
-    search_stmt:bind_values(limit or 50)
-    if search_stmt:bind_match(2, nbrs, lo, len) == nil then
+    search_stmt:bind_values(limit or 50, k1, b)
+    if search_stmt:bind_match(4, nbrs, lo, len) == nil then
       search_stmt:reset()
       return {}
     end
     if vals then
-      search_stmt:bind_weights(3, vals, lo, len)
+      search_stmt:bind_weights(5, vals, lo, len)
     end
     local out = {}
     while true do

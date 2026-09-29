@@ -1000,7 +1000,15 @@ static void tk_bm25_function (
   const Fts5ExtensionApi *api, Fts5Context *fts, sqlite3_context *ctx,
   int nval, sqlite3_value **aval
 ) {
-  const double k1 = 1.2, b = 0.75;
+  double k1 = 1.2, b = 0.75;
+  if (nval > 1 && sqlite3_value_type(aval[1]) != SQLITE_NULL)
+    k1 = sqlite3_value_double(aval[1]);
+  if (nval > 2 && sqlite3_value_type(aval[2]) != SQLITE_NULL)
+    b = sqlite3_value_double(aval[2]);
+  if (k1 < 0.0 || b < 0.0 || b > 1.0) {
+    sqlite3_result_error(ctx, "santoku_bm25: k1 must be >= 0 and b in [0, 1]", -1);
+    return;
+  }
   tk_bm25_data *data = NULL;
   const float *qw = NULL;
   int nqw = 0, ninst = 0;

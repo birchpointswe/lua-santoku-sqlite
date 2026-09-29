@@ -89,6 +89,28 @@ test("fts: term frequency is preserved and affects ranking", function ()
 
 end)
 
+test("fts: k1 and b tune bm25 per index", function ()
+
+  local docs = mkcsr({ 0, 2, 4 }, { 1, 9, 1, 9 }, { 5, 1, 1, 5 })
+  local q = mkcsr({ 0, 1 }, { 1 }, { 1 })
+
+  local db = sql(sqlite.open_memory())
+  local stock = fts.create(db, { name = "stock" })
+  local flat = fts.create(db, { name = "flat", k1 = 0 })
+  stock.add({ "many", "few" }, docs)
+  flat.add({ "many", "few" }, docs)
+
+  local s = stock.search(q, 10)
+  assert(s[1].score < s[2].score)
+  local f = flat.search(q, 10)
+  assert(eq(f[1].score, f[2].score))
+  assert(eq(f[1].coverage, 1))
+
+  assert(not err.pcall(fts.create, db, { name = "bad", k1 = -1 }))
+  assert(not err.pcall(fts.create, db, { name = "bad", b = 2 }))
+
+end)
+
 test("fts: re-adding an id replaces rather than duplicates", function ()
 
   local db = sql(sqlite.open_memory())
