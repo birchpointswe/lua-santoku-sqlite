@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2023 Birch Point SWE
 #ifndef TK_SQLITE_ENC_H
 #define TK_SQLITE_ENC_H
 

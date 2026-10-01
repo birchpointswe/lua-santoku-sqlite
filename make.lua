@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- SPDX-FileCopyrightText: 2023 Birch Point SWE
 local fs = require("santoku.fs")
 local rock = require("santoku.make.rock")
 local vendor = require("santoku.make.vendor")
@@ -17,9 +19,27 @@ end
 
 local env = {
   name = "santoku-sqlite",
-  version = "4.1.1-1",
+  version = "4.1.2-1",
   variable_prefix = "TK_SQLITE",
   license = "MIT",
+  copyright = "Birch Point SWE",
+  vendored = {
+    {
+      name = "SQLite", version = "3.49.2",
+      source = "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip",
+      license = "blessing",
+    },
+    {
+      name = "Monocypher", version = "4.0.1",
+      source = "the santoku-monocypher rock (santoku/monocypher.h)",
+      copyright = {
+        "(c) 2017-2023, Loup Vaillant",
+        "(c) 2017-2019, Michael Savage",
+        "(c) 2017-2023, Fabio Scotoni",
+      },
+      license = "BSD-2-Clause",
+    },
+  },
   public = true,
   rules = {
     include = include,
